@@ -1,3 +1,10 @@
+"""
+qt/api_server.py
+
+Updated to pass through switch_name and router_name fields that the
+agent now includes in its reports when connection_type is Switch or Router.
+"""
+
 import json
 import logging
 from flask import Flask, request, jsonify
@@ -5,6 +12,7 @@ from PyQt6.QtCore import QThread, pyqtSignal
 from qt.logic import Config, lookup_vendor
 
 log = logging.getLogger("mneti.api")
+
 
 class ApiServerThread(QThread):
     device_reported = pyqtSignal(str, dict)  # request_id, device_data
@@ -16,6 +24,7 @@ class ApiServerThread(QThread):
         self._setup_routes()
 
     def _setup_routes(self):
+
         @self.app.route("/api/report", methods=["POST"])
         def receive_report():
             raw = request.get_data()
@@ -24,7 +33,7 @@ class ApiServerThread(QThread):
             except Exception:
                 return jsonify({"error": "bad request"}), 400
 
-            # Minimal validation (token check)
+            # Token check
             if data.get("token") != Config.SHARED_TOKEN:
                 return jsonify({"error": "unauthorized"}), 401
 
@@ -37,23 +46,34 @@ class ApiServerThread(QThread):
             if not vendor:
                 vendor = lookup_vendor(mac)
 
+            # Normalise additional_ports to a plain list of strings
+            raw_ports = data.get("additional_ports", [])
+            if isinstance(raw_ports, list):
+                additional_ports = [str(p) for p in raw_ports]
+            else:
+                additional_ports = []
+
             device = {
-                "hostname": str(data.get("hostname", ""))[:128],
-                "mac": mac,
-                "ip": str(data.get("ip", ""))[:45],
-                "username": str(data.get("username", ""))[:64],
-                "building": str(data.get("building", ""))[:128],
-                "room": str(data.get("room", ""))[:64],
-                "timestamp": str(data.get("timestamp", ""))[:32],
-                "type": str(data.get("type", "managed")),
-                "relay_host": str(data.get("relay_host", ""))[:128],
-                "relay_building": str(data.get("relay_building", ""))[:128],
-                "relay_room": str(data.get("relay_room", ""))[:64],
-                "vendor": vendor,
-                "reporter_ip": request.remote_addr,
-                "connection_type": str(data.get("connection_type", ""))[:32],
-                "port": str(data.get("port", ""))[:32],
-                "additional_ports": data.get("additional_ports", []),
+                "hostname":         str(data.get("hostname",        ""))[:128],
+                "mac":              mac,
+                "ip":               str(data.get("ip",              ""))[:45],
+                "username":         str(data.get("username",        ""))[:64],
+                "building":         str(data.get("building",        ""))[:128],
+                "room":             str(data.get("room",            ""))[:64],
+                "timestamp":        str(data.get("timestamp",       ""))[:32],
+                "type":             str(data.get("type",            "managed")),
+                "relay_host":       str(data.get("relay_host",      ""))[:128],
+                "relay_building":   str(data.get("relay_building",  ""))[:128],
+                "relay_room":       str(data.get("relay_room",      ""))[:64],
+                "vendor":           vendor,
+                "reporter_ip":      request.remote_addr,
+                "connection_type":  str(data.get("connection_type", ""))[:32],
+                # Wall Port fields
+                "port":             str(data.get("port",            ""))[:32],
+                "additional_ports": additional_ports,
+                # Switch / Router name fields (new)
+                "switch_name":      str(data.get("switch_name",     ""))[:128],
+                "router_name":      str(data.get("router_name",     ""))[:128],
             }
 
             self.store.add_result(request_id, device)
@@ -66,4 +86,5 @@ class ApiServerThread(QThread):
 
     def run(self):
         log.info(f"Starting API server on port {Config.HTTP_PORT}")
-        self.app.run(host="0.0.0.0", port=Config.HTTP_PORT, debug=False, threaded=True)
+        self.app.run(host="0.0.0.0", port=Config.HTTP_PORT,
+                     debug=False, threaded=True)

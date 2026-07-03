@@ -32,12 +32,25 @@
         Build-RelayPacket omitted is_primary, so hotspot clients always saw
         is_primary=false and skipped port reporting. Now forwarded correctly.
 
-    FIX 5 - Get-SubnetInfo UInt32 overflow (THIS RELEASE)
+    FIX 5 - Get-SubnetInfo UInt32 overflow
         PowerShell's -shl operator works on [int32], so:
-            [uint32](0xFFFFFFFF -shl 8)  →  [uint32](-256)  →  THROW
-        The overflow only manifests on certain prefix lengths depending on PS
-        version and platform. Rewritten to use a [uint64] intermediate so the
-        shift is always unsigned and the final mask is safely narrowed to 32 bits.
+            [uint32](0xFFFFFFFF -shl 8)  ->  [uint32](-256)  ->  THROW
+        Rewritten to use [Math]::Pow — no shifts, no overflow.
+
+    FIX 6 - Hotspot/relay adapter incorrectly filtered (THIS RELEASE)
+        VIRTUAL_PATTERNS included '*Virtual*' which matched the Microsoft
+        Wi-Fi Direct Virtual Adapter AND the Hosted Network adapter used
+        for Windows hotspot (ICS). This caused Get-NetworkAdapters to skip
+        the 192.168.137.x hotspot interface entirely, so Get-RelayNetworks
+        found no secondary subnets and relay never fired.
+
+        Fix: Filter on InterfaceType instead of name-pattern matching.
+        Real physical adapters are type 6 (Ethernet) or 71 (IEEE 802.11
+        wireless). The Hosted Network adapter (hotspot) is also type 71
+        and MUST be included. Loopback (24) and tunnel (131) types are
+        excluded. Name-pattern exclusions are kept only for the specific
+        adapter names that are purely virtual and have no relay value
+        (Bluetooth, isatap, Teredo).
 #>
 
 Set-StrictMode -Version Latest
@@ -134,9 +147,6 @@ function Test-AlreadySeen {
 }
 
 # ── Subnet arithmetic ─────────────────────────────────────────────────────────
-#
-# 
-#
 function Get-SubnetInfo {
     param([string]$IP, [int]$PrefixLength)
     $ipBytes = ([System.Net.IPAddress]::Parse($IP)).GetAddressBytes()
@@ -151,7 +161,6 @@ function Get-SubnetInfo {
         $hostMask = [uint32]0
     } else {
         $hostBits = 32 - $PrefixLength
-        # Both computed via [Math]::Pow — no subtraction, no -bnot, no overflow
         $hostMask = [uint32]([Math]::Pow(2, $hostBits) - 1)
         $mask     = [uint32]([Math]::Pow(2, 32) - [Math]::Pow(2, $hostBits))
     }
@@ -173,7 +182,6 @@ function Get-SubnetInfo {
 }
 
 function Test-SameSubnet {
-    # Returns true if IP1 and IP2 are in the same subnet at the given prefix length
     param([string]$IP1, [string]$IP2, [int]$PrefixLength)
     try {
         $i1 = Get-SubnetInfo -IP $IP1 -PrefixLength $PrefixLength
@@ -189,28 +197,65 @@ function Test-IsPrivateIP {
             $IP -like '192.168.*')
 }
 
-# ── Virtual adapter skip list ─────────────────────────────────────────────────
-$VIRTUAL_PATTERNS = @(
-    '*WSL*', '*Loopback*', '*Bluetooth*', '*vEthernet*',
-    '*Virtual*', '*Hyper-V*', '*Tunnel*', '*isatap*', '*Teredo*'
+# ── Virtual adapter detection ─────────────────────────────────────────────────
+#
+# FIX 6: The old name-pattern approach used '*Virtual*' which matched the
+# Windows Hosted Network adapter (hotspot, 192.168.137.x).  That broke relay.
+#
+# New approach:
+#   - Keep only the adapters whose InterfaceType is Ethernet (6) or Wireless (71)
+#   - Additionally exclude by name only for adapters that are definitively
+#     non-routable: Bluetooth PAN, isatap, Teredo, and pure software loopbacks
+#   - WSL adapters are type 6 but have 'WSL' or 'vEthernet' in the name; those
+#     are still excluded because they are NAT'd host-only networks, not real
+#     relay candidates.
+#
+# InterfaceType values (from NET_IF_TYPE):
+#   6   = ethernetCsmacd  (wired LAN, also used by most USB-to-Ethernet dongles)
+#   71  = ieee80211        (Wi-Fi, INCLUDING the Windows hotspot/hosted network adapter)
+#   24  = softwareLoopback (always excluded)
+#   131 = tunnel           (always excluded)
+#   53  = propVirtual      (Hyper-V internal switches — excluded)
+
+$ALLOWED_INTERFACE_TYPES = @(6, 71)
+
+# Name-based exclusions applied ONLY after the type filter passes.
+# Kept deliberately narrow so legitimate hotspot/secondary adapters aren't caught.
+$VIRTUAL_NAME_PATTERNS = @(
+    '*Bluetooth*',
+    '*isatap*',
+    '*Teredo*',
+    '*vEthernet*',   # Hyper-V/WSL NAT bridges
+    '*WSL*'
 )
 
 function Test-IsVirtualAdapter {
     param([object]$Adapter)
-    foreach ($p in $VIRTUAL_PATTERNS) {
-        if ($Adapter.Name -like $p -or $Adapter.InterfaceDescription -like $p) { return $true }
+
+    # Exclude by interface type first (fastest check)
+    if ($Adapter.InterfaceType -notin $ALLOWED_INTERFACE_TYPES) {
+        return $true
+    }
+
+    # Then exclude by name patterns that are definitively non-relay
+    foreach ($p in $VIRTUAL_NAME_PATTERNS) {
+        if ($Adapter.Name -like $p -or $Adapter.InterfaceDescription -like $p) {
+            return $true
+        }
     }
     return $false
 }
 
 # ── Network helpers ───────────────────────────────────────────────────────────
 function Get-NetworkAdapters {
-    # Returns all real (non-virtual) physical adapters with their IPs
     $adapters = @()
     try {
         Get-NetAdapter | Where-Object { $_.Status -eq 'Up' } | ForEach-Object {
             $adapter = $_
-            if (Test-IsVirtualAdapter -Adapter $adapter) { return }
+            if (Test-IsVirtualAdapter -Adapter $adapter) {
+                Write-Debug2 "Skipping adapter: $($adapter.Name) [type=$($adapter.InterfaceType)]"
+                return
+            }
             $addrs = Get-NetIPAddress -InterfaceIndex $adapter.InterfaceIndex `
                                       -AddressFamily IPv4 -ErrorAction SilentlyContinue
             foreach ($addr in $addrs) {
@@ -223,7 +268,9 @@ function Get-NetworkAdapters {
                     IP             = $ip
                     InterfaceIndex = $adapter.InterfaceIndex
                     PrefixLength   = $addr.PrefixLength
+                    InterfaceType  = $adapter.InterfaceType
                 }
+                Write-Debug2 "Adapter included: $($adapter.Name) IP=$ip/$($addr.PrefixLength) [type=$($adapter.InterfaceType)]"
             }
         }
     } catch { Write-Warn "Adapter enumeration error: $_" }
@@ -231,7 +278,6 @@ function Get-NetworkAdapters {
 }
 
 function Get-AdapterForSender {
-    # FIX 1: Return the adapter that shares a subnet with SenderIP.
     param([object[]]$Adapters, [string]$SenderIP)
     foreach ($a in $Adapters) {
         if (Test-SameSubnet -IP1 $a.IP -IP2 $SenderIP -PrefixLength $a.PrefixLength) {
@@ -247,7 +293,6 @@ function Get-AdapterForSender {
 }
 
 function Get-RelayNetworks {
-    # FIX 2: Return ONLY adapters NOT on the same subnet as SenderIP.
     param([string]$SenderIP, [object[]]$Adapters)
     $relayNets = @()
     $seen      = @{}
@@ -396,7 +441,6 @@ function Build-RelayPacket {
         [string]$Token,
         [int]   $RelayDepth
     )
-    # FIX 4: Forward is_primary so relay clients also report their ports
     $isPrimary = if ($null -ne $OriginalPayload.is_primary) { [bool]$OriginalPayload.is_primary } else { $false }
 
     $relayPayload = [ordered]@{
@@ -702,7 +746,6 @@ function Invoke-PacketHandler {
     }
 
     if ($shouldRespond -and $reportingAdapter) {
-        # FIX 3: Force additional_ports to a clean [string[]]
         $additionalPorts = @()
         if ($Config.additional_ports) {
             $additionalPorts = @($Config.additional_ports | ForEach-Object { [string]$_ })
@@ -726,6 +769,8 @@ function Invoke-PacketHandler {
             connection_type  = [string]$Config.connection_type
             port             = [string]$Config.port
             additional_ports = $additionalPorts
+            switch_name      = [string]$Config.switch_name
+            router_name      = [string]$Config.router_name
         }
 
         Send-Report -CallbackUrl $callbackUrl -Report $report -Token $Config.token
