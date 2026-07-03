@@ -23,7 +23,7 @@ $CONFIG_FILE = Join-Path $CONFIG_DIR 'config.json'
 function Write-Banner {
     Write-Host ''
     Write-Host ('=' * 58) -ForegroundColor Cyan
-    Write-Host '   Mneti Agent — Location Setup' -ForegroundColor White
+    Write-Host '   Mneti Agent - Location Setup' -ForegroundColor White
     Write-Host ('=' * 58) -ForegroundColor Cyan
     Write-Host '   Enter the physical location of this computer.'
     Write-Host '   This is stored locally and only sent to the IT server'
@@ -76,8 +76,11 @@ function Test-ConstantTimeEqual {
 function Read-Token {
     param([string]$Default = '')
     while ($true) {
-        $prompt = if ($Default) { 'Shared secret token (provided by IT admin) [keep existing]' } `
-                  else          { 'Shared secret token (provided by IT admin)' }
+        if ($Default) {
+            $prompt = 'Shared secret token (provided by IT admin) [keep existing]'
+        } else {
+            $prompt = 'Shared secret token (provided by IT admin)'
+        }
 
         $secure = Read-Host $prompt -AsSecureString
         $plain  = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto(
@@ -97,7 +100,7 @@ function Read-Token {
         $plainConfirm  = $plainConfirm.Trim()
 
         if (-not (Test-ConstantTimeEqual $plain $plainConfirm)) {
-            Write-Host '  [!] Tokens do not match — please try again.' -ForegroundColor Yellow
+            Write-Host '  [!] Tokens do not match - please try again.' -ForegroundColor Yellow
             continue
         }
 
@@ -127,10 +130,106 @@ function Set-RestrictedAcl {
             $adminSid, $rights, $inherit, $prop, $type)))
 
         Set-Acl -Path $Path -AclObject $acl
-        Write-Host "  [+] ACLs applied (SYSTEM + Administrators only)" -ForegroundColor Green
+        Write-Host '  [+] ACLs applied (SYSTEM + Administrators only)' -ForegroundColor Green
     } catch {
         Write-Warning "Could not set ACLs on config file: $($_.Exception.Message)"
     }
+}
+
+# ── Connection-type input (extracted so no switch-inside-function parser issue) ──
+function Read-ConnectionFields {
+    param(
+        [string]$ConnType,
+        [string]$DefaultPort,
+        [string[]]$DefaultAddPorts,
+        [string]$DefaultSwitchName,
+        [string]$DefaultRouterName
+    )
+
+    $result = @{
+        port             = ''
+        additional_ports = @()
+        switch_name      = ''
+        router_name      = ''
+    }
+
+    if ($ConnType -eq 'Wall Port') {
+        Write-Host ''
+        $result.port = Read-NonEmpty `
+            -Prompt '  Wall port number/label' `
+            -Default $DefaultPort `
+            -MaxLen 32 `
+            -AllowEmpty
+
+        $addDefault = ''
+        if ($DefaultAddPorts -and $DefaultAddPorts.Count -gt 0) {
+            $addDefault = $DefaultAddPorts -join ', '
+        }
+        Write-Host ''
+        $addRaw = Read-Host "  Additional wall ports in this room (comma-separated) [$addDefault]"
+        if (-not $addRaw -and $addDefault) {
+            $result.additional_ports = $DefaultAddPorts
+        } else {
+            $result.additional_ports = @(
+                $addRaw.Split(',') | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' }
+            )
+        }
+
+    } elseif ($ConnType -eq 'Switch') {
+        Write-Host ''
+        Write-Host '  Enter the name/label of the switch this computer is connected to.' -ForegroundColor DarkCyan
+        $result.switch_name = Read-NonEmpty `
+            -Prompt '  Switch name/label   ' `
+            -Default $DefaultSwitchName `
+            -MaxLen 128
+
+    } elseif ($ConnType -eq 'Router') {
+        Write-Host ''
+        Write-Host '  Enter the name/label of the router this computer is connected to.' -ForegroundColor DarkCyan
+        $result.router_name = Read-NonEmpty `
+            -Prompt '  Router name/label   ' `
+            -Default $DefaultRouterName `
+            -MaxLen 128
+    }
+
+    return $result
+}
+
+function Write-Summary {
+    param(
+        [string]$BuildingStr,
+        [string]$RoomStr,
+        [string]$ConnType,
+        [string]$PortStr,
+        [string[]]$AddPorts,
+        [string]$SwitchName,
+        [string]$RouterName,
+        [string]$TokenStr
+    )
+
+    Write-Host ''
+    Write-Host ('─' * 58) -ForegroundColor DarkGray
+    Write-Host '  Configuration summary:' -ForegroundColor White
+    Write-Host "    Building        : $BuildingStr"
+    Write-Host "    Room            : $RoomStr"
+    Write-Host "    Connection type : $ConnType"
+
+    if ($ConnType -eq 'Wall Port') {
+        $portDisplay = if ($PortStr) { $PortStr } else { '(none)' }
+        $addDisplay  = if ($AddPorts -and $AddPorts.Count -gt 0) { $AddPorts -join ', ' } else { '(none)' }
+        Write-Host "    Wall port       : $portDisplay"
+        Write-Host "    Additional ports: $addDisplay"
+    } elseif ($ConnType -eq 'Switch') {
+        Write-Host "    Switch name     : $SwitchName"
+    } elseif ($ConnType -eq 'Router') {
+        Write-Host "    Router name     : $RouterName"
+    }
+
+    $maskedLen = [Math]::Min($TokenStr.Length, 8)
+    $masked    = '*' * $maskedLen
+    Write-Host "    Token           : $masked... ($($TokenStr.Length) chars)"
+    Write-Host ('─' * 58) -ForegroundColor DarkGray
+    Write-Host ''
 }
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -138,40 +237,40 @@ function Invoke-Setup {
     Write-Banner
 
     # ── Load existing config as defaults ──────────────────────────────────────
-    $existing = @{
-        building         = ''
-        room             = ''
-        token            = ''
-        connection_type  = 'Wall Port'
-        port             = ''
-        additional_ports = @()
-        switch_name      = ''
-        router_name      = ''
-    }
+    $existingBuilding    = ''
+    $existingRoom        = ''
+    $existingToken       = ''
+    $existingConnType    = 'Wall Port'
+    $existingPort        = ''
+    $existingAddPorts    = @()
+    $existingSwitchName  = ''
+    $existingRouterName  = ''
 
     if (Test-Path $CONFIG_FILE) {
         try {
             $raw    = Get-Content $CONFIG_FILE -Raw -Encoding UTF8
             $parsed = $raw | ConvertFrom-Json
-            $existing.building        = $parsed.building
-            $existing.room            = $parsed.room
-            $existing.token           = $parsed.token
-            if ($parsed.connection_type)  { $existing.connection_type = $parsed.connection_type }
-            if ($parsed.port)             { $existing.port = $parsed.port }
-            if ($parsed.additional_ports) { $existing.additional_ports = @($parsed.additional_ports) }
-            if ($parsed.switch_name)      { $existing.switch_name = $parsed.switch_name }
-            if ($parsed.router_name)      { $existing.router_name = $parsed.router_name }
 
-            Write-Host "  Existing config found — press Enter to keep current values." -ForegroundColor DarkCyan
+            $existingBuilding = $parsed.building
+            $existingRoom     = $parsed.room
+            $existingToken    = $parsed.token
+
+            if ($parsed.connection_type)  { $existingConnType   = $parsed.connection_type }
+            if ($parsed.port)             { $existingPort       = $parsed.port }
+            if ($parsed.additional_ports) { $existingAddPorts   = @($parsed.additional_ports) }
+            if ($parsed.switch_name)      { $existingSwitchName = $parsed.switch_name }
+            if ($parsed.router_name)      { $existingRouterName = $parsed.router_name }
+
+            Write-Host '  Existing config found - press Enter to keep current values.' -ForegroundColor DarkCyan
             Write-Host ''
         } catch {
-            Write-Warning "Existing config.json is unreadable — starting fresh."
+            Write-Warning 'Existing config.json is unreadable - starting fresh.'
         }
     }
 
     # ── Building / Room ───────────────────────────────────────────────────────
-    $buildingStr = Read-NonEmpty -Prompt '  Building name/number' -Default $existing.building -MaxLen 128
-    $roomStr     = Read-NonEmpty -Prompt '  Room number/name    ' -Default $existing.room     -MaxLen 64
+    $buildingStr = Read-NonEmpty -Prompt '  Building name/number' -Default $existingBuilding -MaxLen 128
+    $roomStr     = Read-NonEmpty -Prompt '  Room number/name    ' -Default $existingRoom     -MaxLen 64
 
     # ── Connection type ───────────────────────────────────────────────────────
     Write-Host ''
@@ -180,92 +279,46 @@ function Invoke-Setup {
     Write-Host '    2. Switch'
     Write-Host '    3. Router'
     Write-Host ''
-    $typeChoice = Read-Host "  Select option (1-3) [currently: $($existing.connection_type)]"
+    $typeChoice = Read-Host "  Select option (1-3) [currently: $existingConnType]"
+    $typeChoice = $typeChoice.Trim()
 
-    $connType = switch ($typeChoice.Trim()) {
-        '1'     { 'Wall Port' }
-        '2'     { 'Switch'    }
-        '3'     { 'Router'    }
-        default { $existing.connection_type }
+    if ($typeChoice -eq '1') {
+        $connType = 'Wall Port'
+    } elseif ($typeChoice -eq '2') {
+        $connType = 'Switch'
+    } elseif ($typeChoice -eq '3') {
+        $connType = 'Router'
+    } else {
+        $connType = $existingConnType
     }
 
     # ── Connection-type-specific fields ───────────────────────────────────────
-    $portStr    = ''
-    $addPorts   = @()
-    $switchName = ''
-    $routerName = ''
+    $fields = Read-ConnectionFields `
+        -ConnType          $connType `
+        -DefaultPort       $existingPort `
+        -DefaultAddPorts   $existingAddPorts `
+        -DefaultSwitchName $existingSwitchName `
+        -DefaultRouterName $existingRouterName
 
-    switch ($connType) {
-
-        'Wall Port' {
-            Write-Host ''
-            $portStr = Read-NonEmpty `
-                -Prompt '  Wall port number/label' `
-                -Default $existing.port `
-                -MaxLen 32 `
-                -AllowEmpty
-
-            $addDefault = if ($existing.additional_ports) {
-                              $existing.additional_ports -join ', '
-                          } else { '' }
-            Write-Host ''
-            $addRaw = Read-Host "  Additional wall ports in this room (comma-separated) [$addDefault]"
-            if (-not $addRaw -and $addDefault) {
-                $addPorts = $existing.additional_ports
-            } else {
-                $addPorts = $addRaw.Split(',') |
-                            ForEach-Object { $_.Trim() } |
-                            Where-Object { $_ -ne '' }
-            }
-        }
-
-        'Switch' {
-            Write-Host ''
-            Write-Host '  Enter the name/label of the switch this computer is connected to.' -ForegroundColor DarkCyan
-            $switchName = Read-NonEmpty `
-                -Prompt '  Switch name/label   ' `
-                -Default $existing.switch_name `
-                -MaxLen 128
-        }
-
-        'Router' {
-            Write-Host ''
-            Write-Host '  Enter the name/label of the router this computer is connected to.' -ForegroundColor DarkCyan
-            $routerName = Read-NonEmpty `
-                -Prompt '  Router name/label   ' `
-                -Default $existing.router_name `
-                -MaxLen 128
-        }
-    }
+    $portStr    = $fields.port
+    $addPorts   = $fields.additional_ports
+    $switchName = $fields.switch_name
+    $routerName = $fields.router_name
 
     # ── Token ─────────────────────────────────────────────────────────────────
     Write-Host ''
-    $tokenStr = Read-Token -Default $existing.token
+    $tokenStr = Read-Token -Default $existingToken
 
     # ── Summary ───────────────────────────────────────────────────────────────
-    Write-Host ''
-    Write-Host ('─' * 58) -ForegroundColor DarkGray
-    Write-Host '  Configuration summary:' -ForegroundColor White
-    Write-Host "    Building        : $buildingStr"
-    Write-Host "    Room            : $roomStr"
-    Write-Host "    Connection type : $connType"
-
-    switch ($connType) {
-        'Wall Port' {
-            Write-Host "    Wall port       : $(if ($portStr) { $portStr } else { '(none)' })"
-            Write-Host "    Additional ports: $(if ($addPorts) { $addPorts -join ', ' } else { '(none)' })"
-        }
-        'Switch' {
-            Write-Host "    Switch name     : $switchName"
-        }
-        'Router' {
-            Write-Host "    Router name     : $routerName"
-        }
-    }
-
-    Write-Host "    Token           : $('*' * [Math]::Min($tokenStr.Length, 8))... ($($tokenStr.Length) chars)"
-    Write-Host ('─' * 58) -ForegroundColor DarkGray
-    Write-Host ''
+    Write-Summary `
+        -BuildingStr $buildingStr `
+        -RoomStr     $roomStr `
+        -ConnType    $connType `
+        -PortStr     $portStr `
+        -AddPorts    $addPorts `
+        -SwitchName  $switchName `
+        -RouterName  $routerName `
+        -TokenStr    $tokenStr
 
     $confirm = Read-Host '  Save this configuration? [Y/n]'
     if ($confirm -match '^[Nn]') {
