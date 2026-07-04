@@ -3,54 +3,29 @@
 .SYNOPSIS
     Mneti Agent - UDP Discovery Listener
 .DESCRIPTION
-    Lightweight, high-performance event-driven listener. Binds to UDP 5000 and waits silently.
-    On receiving a valid HMAC-signed discovery broadcast from the IT server:
-      1. Validates the HMAC-SHA256 signature
-      2. Drops self-loopback packets
-      3. Self-reports using the IP on the SAME subnet as the sender
-      4. Relays ONLY into subnets that are NOT the originating subnet
-         (i.e. only hotspot/secondary interfaces)
-      5. Depth tracking prevents relay storms (max depth = 1)
+    Lightweight, high-performance event-driven listener. Binds to UDP 5000
+    and waits silently. On receiving a valid HMAC-signed discovery broadcast:
+      1. Validates HMAC-SHA256 signature
+      2. Deduplicates request_id FIRST — before any expensive work
+      3. Drops self-loopback packets
+      4. Self-reports using the IP on the same subnet as the sender
+      5. Relays into subnets NOT on the originating subnet (hotspot/secondary)
+      6. Depth tracking prevents relay storms (max depth = 1)
+      7. Unmanaged relayed devices inherit relay_host/building/room
 
-.FIXES
-    FIX 1 - Wrong self-report IP
-        Select-Object -First 1 picked whichever adapter enumerated first,
-        sometimes WSL (172.x) instead of the LAN adapter that received the
-        broadcast. Now picks the adapter whose subnet contains SenderIP.
+.FIXES (this release)
+    FIX 7 - Duplicate processing on multi-interface machines
+        The dedup check (Test-AlreadySeen) was called after Get-NetworkAdapters,
+        which is expensive and caused the same request to be fully processed
+        multiple times when both Ethernet and Wi-Fi/hotspot adapters received
+        the broadcast. Moved dedup to the very top of Invoke-PacketHandler,
+        before any adapter work.
 
-    FIX 2 - Relay firing on originating subnet
-        Get-SubnetBroadcast had an integer overflow for large prefix lengths
-        (/22 etc.) causing the same-subnet check to produce wrong broadcasts
-        and miss the match. Rewritten using pure [uint32] arithmetic.
-
-    FIX 3 - additional_ports serialisation
-        ConvertFrom-Json returns PSCustomObject arrays. Forcing to [string[]]
-        before ConvertTo-Json so the JSON comes out as a proper array, not
-        an object or mangled structure.
-
-    FIX 4 - Relay packet missing is_primary
-        Build-RelayPacket omitted is_primary, so hotspot clients always saw
-        is_primary=false and skipped port reporting. Now forwarded correctly.
-
-    FIX 5 - Get-SubnetInfo UInt32 overflow
-        PowerShell's -shl operator works on [int32], so:
-            [uint32](0xFFFFFFFF -shl 8)  ->  [uint32](-256)  ->  THROW
-        Rewritten to use [Math]::Pow — no shifts, no overflow.
-
-    FIX 6 - Hotspot/relay adapter incorrectly filtered (THIS RELEASE)
-        VIRTUAL_PATTERNS included '*Virtual*' which matched the Microsoft
-        Wi-Fi Direct Virtual Adapter AND the Hosted Network adapter used
-        for Windows hotspot (ICS). This caused Get-NetworkAdapters to skip
-        the 192.168.137.x hotspot interface entirely, so Get-RelayNetworks
-        found no secondary subnets and relay never fired.
-
-        Fix: Filter on InterfaceType instead of name-pattern matching.
-        Real physical adapters are type 6 (Ethernet) or 71 (IEEE 802.11
-        wireless). The Hosted Network adapter (hotspot) is also type 71
-        and MUST be included. Loopback (24) and tunnel (131) types are
-        excluded. Name-pattern exclusions are kept only for the specific
-        adapter names that are purely virtual and have no relay value
-        (Bluetooth, isatap, Teredo).
+    FIX 8 - Unmanaged relayed devices missing relay metadata
+        Invoke-SubnetRelay Step 10 built unmanagedReport with empty
+        relay_host/relay_building/relay_room. Those fields now carry the
+        relay host's values so the dashboard can identify them correctly.
+        connection_type is set to "Hotspot" for these devices.
 #>
 
 Set-StrictMode -Version Latest
@@ -198,50 +173,16 @@ function Test-IsPrivateIP {
 }
 
 # ── Virtual adapter detection ─────────────────────────────────────────────────
-#
-# FIX 6: The old name-pattern approach used '*Virtual*' which matched the
-# Windows Hosted Network adapter (hotspot, 192.168.137.x).  That broke relay.
-#
-# New approach:
-#   - Keep only the adapters whose InterfaceType is Ethernet (6) or Wireless (71)
-#   - Additionally exclude by name only for adapters that are definitively
-#     non-routable: Bluetooth PAN, isatap, Teredo, and pure software loopbacks
-#   - WSL adapters are type 6 but have 'WSL' or 'vEthernet' in the name; those
-#     are still excluded because they are NAT'd host-only networks, not real
-#     relay candidates.
-#
-# InterfaceType values (from NET_IF_TYPE):
-#   6   = ethernetCsmacd  (wired LAN, also used by most USB-to-Ethernet dongles)
-#   71  = ieee80211        (Wi-Fi, INCLUDING the Windows hotspot/hosted network adapter)
-#   24  = softwareLoopback (always excluded)
-#   131 = tunnel           (always excluded)
-#   53  = propVirtual      (Hyper-V internal switches — excluded)
-
+# Allow types: 6 (Ethernet), 71 (IEEE 802.11 wireless incl. hosted network/hotspot)
+# Exclude by name only for truly non-routable adapters.
 $ALLOWED_INTERFACE_TYPES = @(6, 71)
-
-# Name-based exclusions applied ONLY after the type filter passes.
-# Kept deliberately narrow so legitimate hotspot/secondary adapters aren't caught.
-$VIRTUAL_NAME_PATTERNS = @(
-    '*Bluetooth*',
-    '*isatap*',
-    '*Teredo*',
-    '*vEthernet*',   # Hyper-V/WSL NAT bridges
-    '*WSL*'
-)
+$VIRTUAL_NAME_PATTERNS   = @('*Bluetooth*', '*isatap*', '*Teredo*', '*vEthernet*', '*WSL*')
 
 function Test-IsVirtualAdapter {
     param([object]$Adapter)
-
-    # Exclude by interface type first (fastest check)
-    if ($Adapter.InterfaceType -notin $ALLOWED_INTERFACE_TYPES) {
-        return $true
-    }
-
-    # Then exclude by name patterns that are definitively non-relay
+    if ($Adapter.InterfaceType -notin $ALLOWED_INTERFACE_TYPES) { return $true }
     foreach ($p in $VIRTUAL_NAME_PATTERNS) {
-        if ($Adapter.Name -like $p -or $Adapter.InterfaceDescription -like $p) {
-            return $true
-        }
+        if ($Adapter.Name -like $p -or $Adapter.InterfaceDescription -like $p) { return $true }
     }
     return $false
 }
@@ -280,13 +221,9 @@ function Get-NetworkAdapters {
 function Get-AdapterForSender {
     param([object[]]$Adapters, [string]$SenderIP)
     foreach ($a in $Adapters) {
-        if (Test-SameSubnet -IP1 $a.IP -IP2 $SenderIP -PrefixLength $a.PrefixLength) {
-            return $a
-        }
+        if (Test-SameSubnet -IP1 $a.IP -IP2 $SenderIP -PrefixLength $a.PrefixLength) { return $a }
         foreach ($pl in @(22, 23, 24)) {
-            if (Test-SameSubnet -IP1 $a.IP -IP2 $SenderIP -PrefixLength $pl) {
-                return $a
-            }
+            if (Test-SameSubnet -IP1 $a.IP -IP2 $SenderIP -PrefixLength $pl) { return $a }
         }
     }
     return $Adapters | Select-Object -First 1
@@ -319,12 +256,12 @@ function Get-RelayNetworks {
 
         $si = Get-SubnetInfo -IP $ip -PrefixLength $prefix
         $relayNets += [pscustomobject]@{
-            IPAddress    = $ip
-            Broadcast    = $si.BroadcastStr
-            Prefix       = $prefix
-            Interface    = $a.InterfaceIndex
-            AdapterName  = $a.Name
-            SubnetInfo   = $si
+            IPAddress   = $ip
+            Broadcast   = $si.BroadcastStr
+            Prefix      = $prefix
+            Interface   = $a.InterfaceIndex
+            AdapterName = $a.Name
+            SubnetInfo  = $si
         }
         Write-Info "Relay subnet detected: $ip/$prefix (broadcast $($si.BroadcastStr)) on $($a.Name)"
     }
@@ -342,13 +279,23 @@ function Get-LoggedInUser {
 function Get-MacVendor {
     param([string]$MAC)
     $oui = @{
-        '00:50:56'='VMware'; '00:0C:29'='VMware'; '00:15:5D'='Hyper-V'
+        '00:50:56'='VMware';  '00:0C:29'='VMware';  '00:15:5D'='Hyper-V'
         '08:00:27'='VirtualBox'; '52:54:00'='QEMU'
         'B8:27:EB'='Raspberry Pi'; 'DC:A6:32'='Raspberry Pi'
-        '00:1A:11'='Google'; 'A4:C3:F0'='Google'
-        'AC:BC:32'='Apple'; '3C:22:FB'='Apple'; '00:17:F2'='Apple'
-        '00:1B:21'='Intel'; '14:18:77'='Dell'; 'B4:B6:86'='HP'
-        '3C:D9:2B'='HP'; '00:23:AE'='Dell'; '18:B4:30'='Nest'
+        '00:1A:11'='Google';  'A4:C3:F0'='Google'
+        'AC:BC:32'='Apple';   '3C:22:FB'='Apple';   '00:17:F2'='Apple'
+        '00:1B:21'='Intel';   '14:18:77'='Dell';    'B4:B6:86'='HP'
+        '3C:D9:2B'='HP';      '00:23:AE'='Dell';    '18:B4:30'='Nest'
+        '18:70:3B'='Huawei';  '40:B0:76'='Huawei';  'E8:CD:2D'='Huawei'
+        '00:9A:CD'='Huawei';  'F4:9F:54'='Huawei';  '28:31:52'='Huawei'
+        'C8:14:79'='Samsung'; '00:07:AB'='Samsung';  '8C:77:12'='Samsung'
+        '00:26:37'='Samsung'; 'A0:75:91'='Samsung';  '78:1F:DB'='Samsung'
+        '98:DE:D0'='Xiaomi';  '28:6C:07'='Xiaomi';  '64:09:80'='Xiaomi'
+        'AC:C1:EE'='Oppo';    '00:1A:7D'='Realtek'; '00:E0:4C'='Realtek'
+        '34:97:F6'='Intel';   '8C:8D:28'='Intel';   'B8:08:CF'='Intel'
+        '00:1C:73'='Aruba';   '00:0B:86'='Aruba';   'F4:DB:E6'='TP-Link'
+        '50:C7:BF'='TP-Link'; 'C8:D3:A3'='TP-Link'; '00:1D:0F'='TP-Link'
+        'CC:40:D0'='Cisco';   '00:1B:54'='Cisco';   '00:16:47'='Cisco'
     }
     if ($MAC.Length -ge 8) {
         $prefix = $MAC.Substring(0, 8).ToUpper()
@@ -455,15 +402,15 @@ function Build-RelayPacket {
     }
 
     $payloadJson = '{"request_id":"' + $relayPayload.request_id +
-                   '","mode":"'       + $relayPayload.mode +
-                   '","target":"'     + $relayPayload.target +
-                   '","token":"'      + $relayPayload.token +
+                   '","mode":"'         + $relayPayload.mode +
+                   '","target":"'       + $relayPayload.target +
+                   '","token":"'        + $relayPayload.token +
                    '","callback_url":"' + $relayPayload.callback_url +
-                   '","timestamp":"'  + $relayPayload.timestamp +
-                   '","relay_depth":' + $relayPayload.relay_depth +
-                   ',"is_primary":'   + $isPrimary.ToString().ToLower() + '}'
+                   '","timestamp":"'    + $relayPayload.timestamp +
+                   '","relay_depth":'   + $relayPayload.relay_depth +
+                   ',"is_primary":'     + $isPrimary.ToString().ToLower() + '}'
 
-    $sig = Get-HmacSha256 -Secret $Token -Message $payloadJson
+    $sig      = Get-HmacSha256 -Secret $Token -Message $payloadJson
     $envelope = @{ payload = $relayPayload; sig = $sig }
     return [System.Text.Encoding]::UTF8.GetBytes(($envelope | ConvertTo-Json -Compress -Depth 5))
 }
@@ -473,8 +420,7 @@ function Get-ArpHostsInSubnet {
     param([string]$LocalIP, [int]$PrefixLength, [string]$ExcludeIP)
     $hosts = @{}
     try {
-        $si = Get-SubnetInfo -IP $LocalIP -PrefixLength $PrefixLength
-
+        $si        = Get-SubnetInfo -IP $LocalIP -PrefixLength $PrefixLength
         $arpOutput = arp -a 2>$null
         foreach ($line in $arpOutput) {
             if ($line -match '(\d{1,3}(?:\.\d{1,3}){3})\s+([\da-fA-F]{2}(?:[:\-][\da-fA-F]{2}){5})\s+(dynamic|static)') {
@@ -536,9 +482,9 @@ function Invoke-SubnetRelay {
     Write-Info "ARP pre-scan: $(@($arpHosts.Keys).Count) host(s) known on $localIP/$prefix"
 
     # Step 3: Start relay HTTP listener
-    $listener         = $null
-    $listenerStarted  = $false
-    $relayPort        = $null
+    $listener        = $null
+    $listenerStarted = $false
+    $relayPort       = $null
     $localCallbackUrl = $null
 
     for ($attempt = 0; $attempt -le 4; $attempt++) {
@@ -563,7 +509,7 @@ function Invoke-SubnetRelay {
     }
 
     try {
-        # Step 4: Build relay packet with confirmed live callback URL
+        # Step 4: Build relay packet
         $packetBytes = Build-RelayPacket `
             -OriginalPayload  $Packet `
             -LocalCallbackUrl $localCallbackUrl `
@@ -581,7 +527,7 @@ function Invoke-SubnetRelay {
             } catch { Write-Warn "Unicast to $arpIP failed: $_" }
         }
 
-        # Step 6: Subnet broadcast for anything not in ARP yet
+        # Step 6: Subnet broadcast
         try {
             $udpBcast = New-Object System.Net.Sockets.UdpClient
             $udpBcast.EnableBroadcast = $true
@@ -590,7 +536,7 @@ function Invoke-SubnetRelay {
             Write-Info "Rebroadcasting discovery to ${broadcastAddr}:$UDP_PORT (depth $newDepth)"
         } catch { Write-Warn "UDP rebroadcast to $broadcastAddr failed: $_" }
 
-        # Step 7: Collect managed responses (30s window)
+        # Step 7: Collect managed responses (30 s window)
         $managedReports = @()
         $deadline       = [DateTime]::Now.AddSeconds(30)
 
@@ -628,7 +574,7 @@ function Invoke-SubnetRelay {
 
         Write-Info "Relay listener completed. Managed responses: $(@($managedReports).Count)"
 
-        # Step 8: Re-read ARP after 30s window
+        # Step 8: Re-read ARP after window
         $arpHostsFinal = Get-ArpHostsInSubnet -LocalIP $localIP -PrefixLength $prefix -ExcludeIP $localIP
         Write-Info "ARP scan found $(@($arpHostsFinal.Keys).Count) device(s) in $localIP/$prefix"
 
@@ -653,11 +599,17 @@ function Invoke-SubnetRelay {
                 relay_building = $MyBuilding
                 relay_room     = $MyRoom
                 vendor         = $mr.vendor
+                connection_type = $mr.connection_type
+                port           = $mr.port
+                switch_name    = $mr.switch_name
+                router_name    = $mr.router_name
             }
             Send-Report -CallbackUrl $Packet.callback_url -Report $relayReport -Token $Config.token
         }
 
         # Step 10: Report ARP-only (unmanaged) devices
+        # FIX 8: Populate relay_host/building/room so the dashboard can identify
+        # these as hotspot-relayed devices. connection_type is set to "Hotspot".
         foreach ($arpIP in $arpHostsFinal.Keys) {
             $arpMac = $arpHostsFinal[$arpIP]
             if ($managedMacs.ContainsKey($arpMac)) { continue }
@@ -675,14 +627,18 @@ function Invoke-SubnetRelay {
                 mac            = $arpMac
                 ip             = $arpIP
                 username       = ''
-                building       = ''
-                room           = ''
+                building       = $MyBuilding
+                room           = $MyRoom
                 timestamp      = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
                 type           = 'unmanaged'
-                relay_host     = ''
-                relay_building = ''
-                relay_room     = ''
+                relay_host     = $MyHostname
+                relay_building = $MyBuilding
+                relay_room     = $MyRoom
                 vendor         = $vendor
+                connection_type = 'Hotspot'
+                port           = ''
+                switch_name    = ''
+                router_name    = ''
             }
             Send-Report -CallbackUrl $Packet.callback_url -Report $unmanagedReport -Token $Config.token
         }
@@ -700,23 +656,29 @@ function Invoke-SubnetRelay {
 function Invoke-PacketHandler {
     param([byte[]]$Data, [string]$SenderIP, [object]$Config)
 
+    # ── FIX 7: Validate and dedup BEFORE any expensive work ──────────────────
+    # Parsing and HMAC validation first (cheap crypto, rejects forgeries)
     $payload = Test-Packet -Bytes $Data -Token $Config.token
     if ($null -eq $payload) { return }
 
     $requestId   = $payload.request_id
-    $mode        = $payload.mode
-    $target      = $payload.target
     $callbackUrl = $payload.callback_url
-    $relayDepth  = [int]$payload.relay_depth
-    $isPrimary   = if ($null -ne $payload.is_primary) { [bool]$payload.is_primary } else { $false }
 
     if (-not $requestId -or -not $callbackUrl) {
         Write-Warn "Packet missing request_id or callback_url - dropped"; return
     }
 
+    # Dedup check immediately after validation — prevents multi-interface
+    # machines from processing the same broadcast more than once
     if (Test-AlreadySeen -RequestId $requestId) {
         Write-Debug2 "Duplicate request_id $requestId - ignored"; return
     }
+
+    # Now do the expensive adapter enumeration (only once per unique request)
+    $mode       = $payload.mode
+    $target     = $payload.target
+    $relayDepth = [int]$payload.relay_depth
+    $isPrimary  = if ($null -ne $payload.is_primary) { [bool]$payload.is_primary } else { $false }
 
     $adapters = Get-NetworkAdapters
     $myIPs    = @($adapters | ForEach-Object { $_.IP })
@@ -751,6 +713,9 @@ function Invoke-PacketHandler {
             $additionalPorts = @($Config.additional_ports | ForEach-Object { [string]$_ })
         }
 
+        $switchName = if ($Config.switch_name) { [string]$Config.switch_name } else { '' }
+        $routerName = if ($Config.router_name) { [string]$Config.router_name } else { '' }
+
         $report = @{
             token            = $Config.token
             request_id       = $requestId
@@ -769,8 +734,8 @@ function Invoke-PacketHandler {
             connection_type  = [string]$Config.connection_type
             port             = [string]$Config.port
             additional_ports = $additionalPorts
-            switch_name      = [string]$Config.switch_name
-            router_name      = [string]$Config.router_name
+            switch_name      = $switchName
+            router_name      = $routerName
         }
 
         Send-Report -CallbackUrl $callbackUrl -Report $report -Token $Config.token

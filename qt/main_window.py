@@ -1,129 +1,113 @@
 """
-qt/main_window.py  (patched v2)
+qt/main_window.py  (patched v3)
 
-Performance & correctness fixes
-────────────────────────────────
-1. FREEZE FIX (broadcast)
-   broadcaster.broadcast() and run_background_arp_scan() run on worker
-   QThreads — the Qt event loop is never blocked.
-
-2. TABLE THRASH
-   DeviceTable.update_devices() was called on every single device arrival.
-   A QTimer coalesces rapid-fire updates into one redraw per 400 ms.
-
-3. TARGETED TIMEOUT
-   Was 5 s, now 30 s.  The round-trip to a remote agent can easily exceed
-   5 s on a loaded LAN.
-
-4. TARGET INPUT
-   Replaced QLineEdit with TargetInputWidget (MAC/IP toggle, auto-format,
-   per-character validation, Enter-to-search).
-
-5. TABLE PERFORMANCE (THIS RELEASE)
-   DeviceTable.update_devices() now:
-     • Calls setUpdatesEnabled(False) + setSortingEnabled(False) before
-       any row mutations so Qt doesn't re-sort or repaint after every cell.
-     • Re-uses existing rows instead of clearing and re-inserting, avoiding
-       the full widget teardown that caused the hang on large result sets.
-     • Only trims or appends rows at the end — O(changed rows) not O(n²).
-     • Restores sort and updates at the end in one pass.
-
-6. HISTORY SESSION LOAD (THIS RELEASE)
-   load_history_by_id() previously called refresh_table() synchronously,
-   which blocked the main thread while building hundreds of rows.
-   Now goes through _schedule_refresh() so the batch timer owns the redraw.
-
-7. FILTER / SEARCH HANG (THIS RELEASE)
-   _on_stat_card_clicked and _on_chip_filter_changed now always go through
-   _schedule_refresh() rather than calling _do_refresh_table() directly,
-   keeping filter changes non-blocking even on large sessions.
+Changes in this release
+───────────────────────
+1. No row colours — all rows white; alternating rows via Qt stylesheet only.
+2. Timestamp displayed in local time (converted from UTC ISO string).
+3. Vendor column populated: Python-side OUI lookup with a larger table as
+   fallback when the agent sends an empty vendor string.
+4. Dark-mode text visibility — QTableWidget and child items are forced to
+   the palette foreground colour so text is always readable.
+5. Target widget uses QComboBox dropdown + rewritten MAC/IP inputs.
+6. Relay metadata on unmanaged hotspot devices (building/room from relay host).
 """
 
 import uuid
 import time
-import threading
 import csv
-import os
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QStackedWidget, QListWidget, QListWidgetItem, QTableWidget,
-    QTableWidgetItem, QHeaderView, QLineEdit, QFormLayout, QFileDialog,
-    QScrollArea, QFrame, QCheckBox, QMessageBox,
+    QTableWidgetItem, QHeaderView, QLineEdit, QFileDialog,
+    QFrame, QCheckBox, QMessageBox,
 )
 from PyQt6.QtCore import Qt, pyqtSlot, QTimer, pyqtSignal, QThread, QObject
+from PyQt6.QtGui import QColor, QPalette
 
 from qt.logic import Config, ResultStore, DiscoveryBroadcaster, get_lan_ip
-from qt.widgets import StatCard, DeviceTable, FilterChipsBar
+from qt.widgets import StatCard, FilterChipsBar
 from qt.api_server import ApiServerThread
 from qt.styles import LIGHT_STYLE, DARK_STYLE
 from qt.logic import scan_subnet, lookup_vendor
 from qt.target_widget import TargetInputWidget
 
 
-# ── Background worker: broadcast + ARP scan ───────────────────────────────────
+# ── OUI vendor lookup (Python-side fallback) ──────────────────────────────────
 
-class _BroadcastWorker(QObject):
+_OUI = {
+    '00:50:56': 'VMware',     '00:0C:29': 'VMware',    '00:15:5D': 'Hyper-V',
+    '08:00:27': 'VirtualBox', '52:54:00': 'QEMU',
+    'B8:27:EB': 'Raspberry Pi','DC:A6:32': 'Raspberry Pi',
+    '00:1A:11': 'Google',     'A4:C3:F0': 'Google',
+    'AC:BC:32': 'Apple',      '3C:22:FB': 'Apple',     '00:17:F2': 'Apple',
+    '00:1B:21': 'Intel',      '34:97:F6': 'Intel',     '8C:8D:28': 'Intel',
+    '14:18:77': 'Dell',       '00:23:AE': 'Dell',
+    'B4:B6:86': 'HP',         '3C:D9:2B': 'HP',
+    '18:70:3B': 'Huawei',     '40:B0:76': 'Huawei',    'E8:CD:2D': 'Huawei',
+    '00:9A:CD': 'Huawei',     'F4:9F:54': 'Huawei',    '28:31:52': 'Huawei',
+    'C8:14:79': 'Samsung',    '00:07:AB': 'Samsung',   '8C:77:12': 'Samsung',
+    '00:26:37': 'Samsung',    'A0:75:91': 'Samsung',   '78:1F:DB': 'Samsung',
+    '98:DE:D0': 'Xiaomi',     '28:6C:07': 'Xiaomi',    '64:09:80': 'Xiaomi',
+    'AC:C1:EE': 'Oppo',
+    '00:1A:7D': 'Realtek',    '00:E0:4C': 'Realtek',
+    '00:1C:73': 'Aruba',      '00:0B:86': 'Aruba',
+    'F4:DB:E6': 'TP-Link',    '50:C7:BF': 'TP-Link',   'C8:D3:A3': 'TP-Link',
+    'CC:40:D0': 'Cisco',      '00:1B:54': 'Cisco',     '00:16:47': 'Cisco',
+    '18:B4:30': 'Nest',
+}
+
+
+def _resolve_vendor(mac: str, agent_vendor: str) -> str:
+    """Return vendor string: prefer what the agent sent, fall back to local OUI."""
+    if agent_vendor and agent_vendor.strip():
+        return agent_vendor.strip()
+    if mac and len(mac) >= 8:
+        prefix = mac[:8].upper()
+        return _OUI.get(prefix, '')
+    return ''
+
+
+# ── Timestamp helper ──────────────────────────────────────────────────────────
+
+def _utc_to_local(ts: str) -> str:
     """
-    Runs broadcaster.broadcast() and (after a delay) the ARP scan on a
-    dedicated QThread so the main thread stays responsive.
+    Convert a UTC ISO-8601 string (e.g. '2026-07-04T11:05:31Z') to local
+    wall-clock time formatted as 'YYYY-MM-DD HH:MM:SS'.
+    Falls back to the original string if parsing fails.
     """
-    device_found = pyqtSignal(str, dict)   # session_id, device
-    finished     = pyqtSignal()
-
-    def __init__(self, broadcaster, store, session_id: str,
-                 mode: str = "full", target: str = ""):
-        super().__init__()
-        self._broadcaster = broadcaster
-        self._store       = store
-        self._session_id  = session_id
-        self._mode        = mode
-        self._target      = target
-
-    def run(self):
+    if not ts:
+        return ''
+    ts = ts.strip()
+    for fmt in ('%Y-%m-%dT%H:%M:%SZ', '%Y-%m-%dT%H:%M:%S.%fZ',
+                '%Y-%m-%dT%H:%M:%S+00:00', '%Y-%m-%dT%H:%M:%S'):
         try:
-            # 1. Send UDP broadcast(s) — fast but uses sockets
-            self._broadcaster.broadcast(self._session_id, self._mode, self._target)
-
-            # 2. For full scans also run ARP (deferred 3 s)
-            if self._mode == "full":
-                time.sleep(3.0)
-                networks = self._broadcaster.get_scan_networks()
-                for net in networks:
-                    found = scan_subnet(net)
-                    for ip, mac in found.items():
-                        device = {
-                            "hostname":    f"Unmanaged-{ip}",
-                            "mac":         mac,
-                            "ip":          ip,
-                            "type":        "unmanaged",
-                            "vendor":      lookup_vendor(mac),
-                            "timestamp":   datetime.now(timezone.utc).isoformat(),
-                            "reporter_ip": "internal-arp-scan",
-                        }
-                        self._store.add_result(self._session_id, device)
-                        self.device_found.emit(self._session_id, device)
-        finally:
-            self.finished.emit()
+            dt_utc   = datetime.strptime(ts, fmt).replace(tzinfo=timezone.utc)
+            dt_local = dt_utc.astimezone()          # converts to local tz
+            return dt_local.strftime('%Y-%m-%d %H:%M:%S')
+        except ValueError:
+            continue
+    # Already a plain string like '2026-07-04 11:05:31' — return as-is
+    return ts.replace('T', ' ').split('.')[0][:19]
 
 
-# ── Optimised DeviceTable ─────────────────────────────────────────────────────
+# ── Column layout ─────────────────────────────────────────────────────────────
 
-# Column layout — kept in one place so it's easy to extend.
 _COLUMNS = [
-    ("Hostname",        "hostname",        220),
-    ("IP Address",      "ip",              130),
-    ("MAC Address",     "mac",             150),
-    ("Username",        "username",        120),
-    ("Building",        "building",        110),
-    ("Room",            "room",             90),
-    ("Type",            "type",             90),
-    ("Connection",      "connection_type",  90),
-    ("Port / Name",     "_port_display",   110),
-    ("Vendor",          "vendor",          110),
-    ("Relay Host",      "relay_host",      120),
-    ("Timestamp",       "timestamp",       150),
+    ("Hostname",      "hostname",        220),
+    ("IP Address",    "ip",              130),
+    ("MAC Address",   "mac",             150),
+    ("Username",      "username",        120),
+    ("Building",      "building",        120),
+    ("Room",          "room",             90),
+    ("Type",          "type",             90),
+    ("Connection",    "connection_type",  90),
+    ("Port / Name",   "_port_display",   120),
+    ("Vendor",        "_vendor_display", 110),
+    ("Relay Host",    "relay_host",      130),
+    ("Timestamp",     "_local_ts",       160),
 ]
 
 
@@ -148,23 +132,24 @@ def _device_matches_search(device: dict, query: str) -> bool:
         return True
     q = query.lower()
     searchable = (
-        device.get("hostname", "") + device.get("ip", "") +
-        device.get("mac", "") + device.get("room", "") +
-        device.get("building", "") + device.get("username", "") +
-        device.get("type", "")
+        device.get("hostname", "")       + device.get("ip", "") +
+        device.get("mac", "")            + device.get("room", "") +
+        device.get("building", "")       + device.get("username", "") +
+        device.get("type", "")           + device.get("relay_host", "") +
+        device.get("connection_type", "")
     ).lower()
     return q in searchable
 
 
 def _port_display(device: dict) -> str:
-    """Unified display string for the Port / Name column."""
     conn = device.get("connection_type", "")
     if conn == "Switch":
         return device.get("switch_name", "") or ""
     if conn == "Router":
         return device.get("router_name", "") or ""
-    # Wall Port (default)
-    port = device.get("port", "")
+    if conn == "Hotspot":
+        return ""
+    port  = device.get("port", "")
     extra = device.get("additional_ports", [])
     if extra:
         all_ports = [port] + [str(p) for p in extra if str(p) != port]
@@ -172,26 +157,28 @@ def _port_display(device: dict) -> str:
     return port or ""
 
 
-def _row_color(device: dict) -> str | None:
-    dtype = device.get("type", "unmanaged")
-    relay = device.get("relay_host", "")
-    if dtype == "managed":
-        return None                  # default background
-    if dtype == "relayed":
-        return "#e8f5e9"             # light green — managed via hotspot relay
-    if dtype == "unmanaged" and relay:
-        return "#fff8e1"             # light amber — unmanaged, seen via relay
-    return "#fce4e4"                 # light red — unmanaged on primary subnet
+def _cell_text(device: dict, key: str) -> str:
+    if key == "_port_display":
+        return _port_display(device)
+    if key == "_vendor_display":
+        return _resolve_vendor(device.get("mac", ""), device.get("vendor", ""))
+    if key == "_local_ts":
+        return _utc_to_local(device.get("timestamp", ""))
+    val = device.get(key, "")
+    if isinstance(val, list):
+        return ", ".join(str(p) for p in val)
+    return str(val) if val else ""
 
+
+# ── Optimised DeviceTable ─────────────────────────────────────────────────────
 
 class OptimisedDeviceTable(QTableWidget):
     """
-    Drop-in replacement for DeviceTable.
-
-    update_devices() re-uses existing rows (no full clear/re-insert),
-    disables sorting and screen updates during bulk mutations, and only
-    repaints once at the end.  This cuts the hang on 200+ device sessions
-    from several seconds to a few tens of milliseconds.
+    High-performance device table.
+    • No row background colours (all white / palette default).
+    • Bulk mutations wrapped in setUpdatesEnabled(False)+setSortingEnabled(False).
+    • Existing rows are reused; only changed cells are rewritten.
+    • Dark-mode aware: item foreground follows the widget palette.
     """
 
     def __init__(self, parent=None):
@@ -209,65 +196,98 @@ class OptimisedDeviceTable(QTableWidget):
         self.setSortingEnabled(True)
 
     def update_devices(self, devices: list, filter_key: str = "all", search: str = ""):
-        # Build the filtered list first (cheap, no Qt calls)
         visible = [
             d for d in devices
             if _device_matches_filter(d, filter_key)
             and _device_matches_search(d, search)
         ]
 
-        # ── Freeze repaints and sorting while mutating rows ───────────────────
         self.setUpdatesEnabled(False)
         self.setSortingEnabled(False)
 
         current_rows = self.rowCount()
         needed_rows  = len(visible)
 
-        # Grow table if needed
         if needed_rows > current_rows:
             self.setRowCount(needed_rows)
 
-        # Fill / update each visible row
+        # Use the widget's current palette foreground for text colour
+        fg = self.palette().color(QPalette.ColorRole.Text)
+
         for row_idx, device in enumerate(visible):
-            port_val = _port_display(device)
-            color    = _row_color(device)
-
             for col_idx, (_, key, _) in enumerate(_COLUMNS):
-                if key == "_port_display":
-                    cell_text = port_val
-                else:
-                    val = device.get(key, "")
-                    cell_text = ", ".join(str(p) for p in val) if isinstance(val, list) else str(val)
-
-                existing = self.item(row_idx, col_idx)
+                cell_text = _cell_text(device, key)
+                existing  = self.item(row_idx, col_idx)
                 if existing is None:
                     item = QTableWidgetItem(cell_text)
                     item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-                    if color:
-                        from PyQt6.QtGui import QColor
-                        item.setBackground(QColor(color))
+                    item.setForeground(fg)
                     self.setItem(row_idx, col_idx, item)
                 else:
-                    # Only update if something actually changed (avoids flicker)
                     if existing.text() != cell_text:
                         existing.setText(cell_text)
-                    if color:
-                        from PyQt6.QtGui import QColor
-                        existing.setBackground(QColor(color))
+                    existing.setForeground(fg)
 
-        # Trim surplus rows (devices filtered out or session cleared)
         if needed_rows < current_rows:
             self.setRowCount(needed_rows)
 
-        # ── Restore normal Qt behaviour ───────────────────────────────────────
         self.setSortingEnabled(True)
         self.setUpdatesEnabled(True)
+
+    def apply_theme(self, dark: bool):
+        """Call after a theme change so existing rows pick up the new colour."""
+        fg = self.palette().color(QPalette.ColorRole.Text)
+        self.setUpdatesEnabled(False)
+        for row in range(self.rowCount()):
+            for col in range(self.columnCount()):
+                item = self.item(row, col)
+                if item:
+                    item.setForeground(fg)
+        self.setUpdatesEnabled(True)
+
+
+# ── Background worker ─────────────────────────────────────────────────────────
+
+class _BroadcastWorker(QObject):
+    device_found = pyqtSignal(str, dict)
+    finished     = pyqtSignal()
+
+    def __init__(self, broadcaster, store, session_id: str,
+                 mode: str = "full", target: str = ""):
+        super().__init__()
+        self._broadcaster = broadcaster
+        self._store       = store
+        self._session_id  = session_id
+        self._mode        = mode
+        self._target      = target
+
+    def run(self):
+        try:
+            self._broadcaster.broadcast(self._session_id, self._mode, self._target)
+            if self._mode == "full":
+                time.sleep(3.0)
+                networks = self._broadcaster.get_scan_networks()
+                for net in networks:
+                    found = scan_subnet(net)
+                    for ip, mac in found.items():
+                        device = {
+                            "hostname":    f"Unmanaged-{ip}",
+                            "mac":         mac,
+                            "ip":          ip,
+                            "type":        "unmanaged",
+                            "vendor":      lookup_vendor(mac),
+                            "timestamp":   datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+                            "reporter_ip": "internal-arp-scan",
+                        }
+                        self._store.add_result(self._session_id, device)
+                        self.device_found.emit(self._session_id, device)
+        finally:
+            self.finished.emit()
 
 
 # ── MainWindow ────────────────────────────────────────────────────────────────
 
 class MainWindow(QMainWindow):
-    # Internal signal: device arrived from ARP worker (already on bg thread)
     _arp_device_arrived = pyqtSignal(str, dict)
 
     def __init__(self):
@@ -275,15 +295,13 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Mneti — Administrative Discovery Dashboard")
         self.resize(1200, 750)
 
-        # Countdown / progress
         self.countdown_val   = 0
         self.countdown_timer = QTimer()
         self.countdown_timer.timeout.connect(self._update_countdown)
 
-        # Batched table refresh — coalesces rapid device-arrived signals
         self._batch_timer = QTimer()
         self._batch_timer.setSingleShot(True)
-        self._batch_timer.setInterval(400)   # ms between table redraws
+        self._batch_timer.setInterval(400)
         self._batch_timer.timeout.connect(self._do_refresh_table)
 
         self._arp_device_arrived.connect(self._on_arp_device)
@@ -305,9 +323,7 @@ class MainWindow(QMainWindow):
         self.set_theme(False)
         self.show_view("discover")
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # UI setup
-    # ─────────────────────────────────────────────────────────────────────────
+    # ── UI setup ──────────────────────────────────────────────────────────────
 
     def _setup_ui(self):
         central = QWidget()
@@ -316,15 +332,14 @@ class MainWindow(QMainWindow):
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(0)
 
-        # ── Sidebar ───────────────────────────────────────────────────────────
+        # Sidebar
         self.sidebar = QWidget()
         self.sidebar.setObjectName("Sidebar")
         sb_layout = QVBoxLayout(self.sidebar)
         sb_layout.setContentsMargins(0, 20, 0, 20)
 
         logo = QLabel("MNETI")
-        logo.setStyleSheet(
-            "font-size: 18px; font-weight: bold; margin-bottom: 20px; padding: 10px 20px;")
+        logo.setStyleSheet("font-size:18px; font-weight:bold; margin-bottom:20px; padding:10px 20px;")
         sb_layout.addWidget(logo)
 
         self.nav_btns = {}
@@ -334,7 +349,7 @@ class MainWindow(QMainWindow):
             ("history",  "◷ Session History"),
         ]:
             btn = QPushButton(text)
-            btn.clicked.connect(lambda _checked, k=key: self.show_view(k))
+            btn.clicked.connect(lambda _c, k=key: self.show_view(k))
             sb_layout.addWidget(btn)
             self.nav_btns[key] = btn
 
@@ -345,12 +360,11 @@ class MainWindow(QMainWindow):
         sb_layout.addWidget(self.theme_btn)
 
         info = QLabel(f"Server: Online\nIP: {get_lan_ip()}")
-        info.setStyleSheet("font-size: 11px; color: #777; padding: 20px;")
+        info.setStyleSheet("font-size:11px; color:#777; padding:20px;")
         sb_layout.addWidget(info)
 
         main_layout.addWidget(self.sidebar)
 
-        # ── Content stack ─────────────────────────────────────────────────────
         self.content_stack = QStackedWidget()
         main_layout.addWidget(self.content_stack)
 
@@ -358,40 +372,30 @@ class MainWindow(QMainWindow):
         self._init_ranges_view()
         self._init_history_view()
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # Discover view
-    # ─────────────────────────────────────────────────────────────────────────
+    # ── Discover view ─────────────────────────────────────────────────────────
 
     def _init_discover_view(self):
-        page = QWidget()
+        page   = QWidget()
         layout = QVBoxLayout(page)
         layout.setContentsMargins(20, 20, 20, 20)
 
-        # Header row
         header = QHBoxLayout()
         title_v = QVBoxLayout()
         title_v.addWidget(QLabel("Discovery Dashboard",
-                                 styleSheet="font-size: 20px; font-weight: bold;"))
+                                 styleSheet="font-size:20px; font-weight:bold;"))
         title_v.addWidget(QLabel("Network device location system",
-                                 styleSheet="font-size: 11px; color: #666;"))
+                                 styleSheet="font-size:11px; color:#666;"))
         header.addLayout(title_v)
         header.addStretch()
 
         self.search_input = QLineEdit()
         self.search_input.setPlaceholderText("🔍 Search IP, MAC, room…")
         self.search_input.setFixedWidth(220)
-        self.search_input.setStyleSheet(
-            "QLineEdit { background:#fff; color:#212529; border:1px solid #ced4da;"
-            " border-radius:4px; padding:5px 10px; font-size:13px; }"
-            "QLineEdit:focus { border-color:#80bdff; }"
-        )
         self.search_input.textChanged.connect(self._schedule_refresh)
         header.addWidget(self.search_input)
-
         header.addSpacing(8)
 
         self.reset_btn = QPushButton("↺ New Session")
-        self.reset_btn.setToolTip("Clear results and start a new discovery session")
         self.reset_btn.clicked.connect(self.reset_session)
         header.addWidget(self.reset_btn)
 
@@ -411,8 +415,7 @@ class MainWindow(QMainWindow):
         self.progress_panel.hide()
         pp_layout = QHBoxLayout(self.progress_panel)
         self.status_label = QLabel("SEARCHING...")
-        self.status_label.setStyleSheet(
-            "color:#0366d6; font-weight:bold; font-size:13px;")
+        self.status_label.setStyleSheet("color:#0366d6; font-weight:bold; font-size:13px;")
         pp_layout.addWidget(self.status_label)
         pp_layout.addStretch()
         layout.addWidget(self.progress_panel)
@@ -420,11 +423,11 @@ class MainWindow(QMainWindow):
         # Stat cards
         self.stats_bar = QHBoxLayout()
         self.stat_cards = {
-            "all":               StatCard("Total Discovered",   0, "#6c757d", "all"),
-            "managed":           StatCard("Managed",            0, "#0366d6", "managed"),
-            "managed_hotspot":   StatCard("Relayed",            0, "#28a745", "managed_hotspot"),
-            "unmanaged_hotspot": StatCard("Unmanaged Hotspot",  0, "#f59f00", "unmanaged_hotspot"),
-            "unmanaged":         StatCard("Unmanaged",          0, "#dc3545", "unmanaged"),
+            "all":               StatCard("Total Discovered",  0, "#6c757d", "all"),
+            "managed":           StatCard("Managed",           0, "#0366d6", "managed"),
+            "managed_hotspot":   StatCard("Relayed",           0, "#28a745", "managed_hotspot"),
+            "unmanaged_hotspot": StatCard("Unmanaged Hotspot", 0, "#f59f00", "unmanaged_hotspot"),
+            "unmanaged":         StatCard("Unmanaged",         0, "#dc3545", "unmanaged"),
         }
         for card in self.stat_cards.values():
             card.clicked.connect(self._on_stat_card_clicked)
@@ -434,23 +437,19 @@ class MainWindow(QMainWindow):
         # Action panels
         panels = QHBoxLayout()
 
-        # ── Targeted Discovery panel ──────────────────────────────────────────
         target_panel = QFrame()
         target_panel.setObjectName("Panel")
         tp_layout = QVBoxLayout(target_panel)
         tp_layout.addWidget(QLabel("Targeted Discovery",
                                    styleSheet="font-weight:bold; font-size:14px;"))
-
         self.target_widget = TargetInputWidget()
         self.target_widget.search_requested.connect(self.start_targeted_discovery)
         tp_layout.addWidget(self.target_widget)
-
         tp_layout.addWidget(QLabel(
             "Sends a UDP broadcast. Only the matching device responds.",
             styleSheet="font-size:11px; color:#6c757d; margin-top:4px;"))
         panels.addWidget(target_panel)
 
-        # ── Full Discovery panel ──────────────────────────────────────────────
         full_panel = QFrame()
         full_panel.setObjectName("Panel")
         fp_layout = QVBoxLayout(full_panel)
@@ -460,7 +459,6 @@ class MainWindow(QMainWindow):
             "Broadcast discovery to all clients — including custom ranges. "
             "All listening devices will report their location.",
             styleSheet="font-size:13px; color:#555; margin-bottom:12px;"))
-
         btn_all = QPushButton("Scan Network")
         btn_all.setObjectName("Primary")
         btn_all.clicked.connect(self.start_full_discovery)
@@ -470,37 +468,33 @@ class MainWindow(QMainWindow):
 
         layout.addLayout(panels)
 
-        # Filter chips
         self.chips_bar = FilterChipsBar()
         self.chips_bar.filter_changed.connect(self._on_chip_filter_changed)
         layout.addWidget(self.chips_bar)
 
-        # Results table — use the optimised implementation
         self.table = OptimisedDeviceTable()
         layout.addWidget(self.table)
 
         self.content_stack.addWidget(page)
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # Ranges view
-    # ─────────────────────────────────────────────────────────────────────────
+    # ── Ranges view ───────────────────────────────────────────────────────────
 
     def _init_ranges_view(self):
-        page = QWidget()
+        page   = QWidget()
         layout = QVBoxLayout(page)
         layout.setContentsMargins(20, 20, 20, 20)
 
         layout.addWidget(QLabel("Broadcast Ranges",
-                                styleSheet="font-size: 20px; font-weight: bold;"))
+                                styleSheet="font-size:20px; font-weight:bold;"))
         layout.addWidget(QLabel("Define custom subnets for discovery broadcasts",
-                                styleSheet="margin-bottom: 20px;"))
+                                styleSheet="margin-bottom:20px;"))
 
         form_panel = QFrame()
         form_panel.setObjectName("Panel")
         form_h = QHBoxLayout(form_panel)
         self.range_input = QLineEdit()
         self.range_input.setPlaceholderText("e.g. 10.51.144.1-254")
-        self.range_input.setStyleSheet("font-family: Consolas, monospace;")
+        self.range_input.setStyleSheet("font-family:Consolas,monospace;")
         self.range_input.returnPressed.connect(self.add_custom_range)
 
         add_btn = QPushButton("Add")
@@ -523,13 +517,13 @@ class MainWindow(QMainWindow):
 
         self.range_preview = QLabel("")
         self.range_preview.setStyleSheet(
-            "font-size: 11px; color: #6c757d; font-family: Consolas, monospace;")
+            "font-size:11px; color:#6c757d; font-family:Consolas,monospace;")
         layout.addWidget(self.range_preview)
         self.range_input.textChanged.connect(self.update_range_preview)
 
         list_header = QHBoxLayout()
         list_header.addWidget(QLabel("Saved Discovery Ranges",
-                                     styleSheet="font-weight: bold; margin-top: 10px;"))
+                                     styleSheet="font-weight:bold; margin-top:10px;"))
         list_header.addStretch()
         scan_all_btn = QPushButton("Scan All Saved Ranges")
         scan_all_btn.clicked.connect(self.scan_all_custom_ranges)
@@ -550,16 +544,14 @@ class MainWindow(QMainWindow):
         self.content_stack.addWidget(page)
         self.refresh_ranges_list()
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # History view
-    # ─────────────────────────────────────────────────────────────────────────
+    # ── History view ──────────────────────────────────────────────────────────
 
     def _init_history_view(self):
-        page = QWidget()
+        page   = QWidget()
         layout = QVBoxLayout(page)
         layout.setContentsMargins(20, 20, 20, 20)
         layout.addWidget(QLabel("Session History",
-                                styleSheet="font-size: 20px; font-weight: bold;"))
+                                styleSheet="font-size:20px; font-weight:bold;"))
         self.history_table = QTableWidget()
         self.history_table.setColumnCount(5)
         self.history_table.setHorizontalHeaderLabels(
@@ -568,16 +560,12 @@ class MainWindow(QMainWindow):
             QHeaderView.ResizeMode.Stretch)
         self.history_table.verticalHeader().setVisible(False)
         self.history_table.itemDoubleClicked.connect(self.load_history_session_item)
-        self.history_table.setSelectionBehavior(
-            QTableWidget.SelectionBehavior.SelectRows)
-        self.history_table.setEditTriggers(
-            QTableWidget.EditTrigger.NoEditTriggers)
+        self.history_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.history_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         layout.addWidget(self.history_table)
         self.content_stack.addWidget(page)
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # Navigation
-    # ─────────────────────────────────────────────────────────────────────────
+    # ── Navigation ────────────────────────────────────────────────────────────
 
     def show_view(self, key: str):
         for k, btn in self.nav_btns.items():
@@ -600,15 +588,10 @@ class MainWindow(QMainWindow):
 
     def set_theme(self, dark: bool):
         self.setStyleSheet(DARK_STYLE if dark else LIGHT_STYLE)
-        self.search_input.setStyleSheet(
-            "QLineEdit { background:#fff; color:#212529; border:1px solid #ced4da;"
-            " border-radius:4px; padding:5px 10px; font-size:13px; }"
-            "QLineEdit:focus { border-color:#80bdff; }"
-        )
+        # Force table items to inherit the new palette text colour
+        self.table.apply_theme(dark)
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # Filter routing — always go through the batch timer (no direct table call)
-    # ─────────────────────────────────────────────────────────────────────────
+    # ── Filter routing ────────────────────────────────────────────────────────
 
     def _on_stat_card_clicked(self, filter_key: str):
         self.current_filter = filter_key
@@ -619,12 +602,9 @@ class MainWindow(QMainWindow):
         self.current_filter = filter_key
         self._schedule_refresh()
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # Session management
-    # ─────────────────────────────────────────────────────────────────────────
+    # ── Session management ────────────────────────────────────────────────────
 
     def reset_session(self):
-        """Stop any running scan and clear the display."""
         self._stop_worker()
         self.countdown_timer.stop()
         self._batch_timer.stop()
@@ -660,7 +640,6 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Invalid Target",
                                 "Please enter a valid MAC address or IP address.")
             return
-
         mode = "targeted_mac" if self.target_widget.mode() == "mac" else "targeted_ip"
         self.reset_session()
         sid = str(uuid.uuid4())
@@ -672,30 +651,24 @@ class MainWindow(QMainWindow):
 
     def _launch_worker(self, mode: str, target: str = ""):
         self._stop_worker()
-
         worker = _BroadcastWorker(self.broadcaster, self.store,
                                   self.active_session_id, mode, target)
         thread = QThread(self)
         worker.moveToThread(thread)
-
         thread.started.connect(worker.run)
         worker.device_found.connect(self._arp_device_arrived)
         worker.finished.connect(thread.quit)
         worker.finished.connect(worker.deleteLater)
         thread.finished.connect(thread.deleteLater)
-
         self._worker        = worker
         self._worker_thread = thread
         thread.start()
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # Countdown
-    # ─────────────────────────────────────────────────────────────────────────
+    # ── Countdown ─────────────────────────────────────────────────────────────
 
     def start_countdown(self, seconds: int):
         self.countdown_val = seconds
-        self.status_label.setText(
-            f"NETWORK SCANNING IN PROGRESS… {seconds}s REMAINING")
+        self.status_label.setText(f"NETWORK SCANNING IN PROGRESS… {seconds}s REMAINING")
         self.progress_panel.show()
         self.countdown_timer.start(1000)
 
@@ -704,38 +677,30 @@ class MainWindow(QMainWindow):
         if self.countdown_val <= 0:
             self.countdown_timer.stop()
             session = self.store.get_session(self.active_session_id) if self.active_session_id else None
-            count = len(session["devices"]) if session else 0
-            self.status_label.setText(
-                f"SCAN COMPLETE — {count} device(s) found")
+            count   = len(session["devices"]) if session else 0
+            self.status_label.setText(f"SCAN COMPLETE — {count} device(s) found")
             QTimer.singleShot(5000, self.progress_panel.hide)
         else:
             self.status_label.setText(
                 f"NETWORK SCANNING IN PROGRESS… {self.countdown_val}s REMAINING")
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # Device arrival (managed via HTTP and unmanaged via ARP)
-    # ─────────────────────────────────────────────────────────────────────────
+    # ── Device arrival ────────────────────────────────────────────────────────
 
     @pyqtSlot(str, dict)
     def on_device_reported(self, req_id: str, device: dict):
-        """Called on the main thread via ApiServerThread signal."""
         if req_id == self.active_session_id:
             self.update_stats()
             self._schedule_refresh()
 
     @pyqtSlot(str, dict)
     def _on_arp_device(self, req_id: str, device: dict):
-        """Called on the main thread via _arp_device_arrived signal."""
         if req_id == self.active_session_id:
             self.update_stats()
             self._schedule_refresh()
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # Batched table refresh
-    # ─────────────────────────────────────────────────────────────────────────
+    # ── Batched table refresh ─────────────────────────────────────────────────
 
     def _schedule_refresh(self, *_):
-        """Coalesce rapid device-arrived signals into one redraw per 400 ms."""
         if not self._batch_timer.isActive():
             self._batch_timer.start()
 
@@ -751,12 +716,9 @@ class MainWindow(QMainWindow):
             )
 
     def refresh_table(self):
-        """Legacy alias — routes through the batch timer for safety."""
         self._schedule_refresh()
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # Stats
-    # ─────────────────────────────────────────────────────────────────────────
+    # ── Stats ─────────────────────────────────────────────────────────────────
 
     def update_stats(self):
         if not self.active_session_id:
@@ -765,10 +727,8 @@ class MainWindow(QMainWindow):
         if not session:
             return
         devices = session["devices"]
-        counts = {
-            "all": len(devices), "managed": 0,
-            "managed_hotspot": 0, "unmanaged_hotspot": 0, "unmanaged": 0,
-        }
+        counts  = {"all": len(devices), "managed": 0,
+                   "managed_hotspot": 0, "unmanaged_hotspot": 0, "unmanaged": 0}
         for d in devices:
             dtype = d.get("type", "unmanaged")
             relay = d.get("relay_host", "")
@@ -785,9 +745,7 @@ class MainWindow(QMainWindow):
             self.stat_cards[key].set_count(count)
         self.chips_bar.set_counts(counts)
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # Range management
-    # ─────────────────────────────────────────────────────────────────────────
+    # ── Range management ──────────────────────────────────────────────────────
 
     def add_custom_range(self):
         cidr = self.range_input.text().strip()
@@ -850,16 +808,14 @@ class MainWindow(QMainWindow):
         self.ranges_list.clear()
         for r in self.broadcaster.get_ranges():
             prefix = "[PRIMARY] " if r.is_primary else ""
-            item = QListWidgetItem(
+            item   = QListWidgetItem(
                 f"{prefix}{r.network} (Broadcast: {r.broadcast}, Hosts: {r.host_count})")
             if r.is_primary:
                 item.setForeground(Qt.GlobalColor.blue)
             item.setData(Qt.ItemDataRole.UserRole, str(r.network))
             self.ranges_list.addItem(item)
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # History
-    # ─────────────────────────────────────────────────────────────────────────
+    # ── History ───────────────────────────────────────────────────────────────
 
     def refresh_history_list(self):
         self.history_table.setRowCount(0)
@@ -867,7 +823,7 @@ class MainWindow(QMainWindow):
             row = self.history_table.rowCount()
             self.history_table.insertRow(row)
             short_id = h["request_id"][:8].upper() + "…"
-            id_item = QTableWidgetItem(short_id)
+            id_item  = QTableWidgetItem(short_id)
             id_item.setData(Qt.ItemDataRole.UserRole, h["request_id"])
             id_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             self.history_table.setItem(row, 0, id_item)
@@ -877,7 +833,7 @@ class MainWindow(QMainWindow):
             count_item = QTableWidgetItem(f"{h['device_count']} devices")
             count_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             self.history_table.setItem(row, 2, count_item)
-            ts = h["started_at"].replace("T", " ").split(".")[0]
+            ts      = _utc_to_local(h.get("started_at", ""))
             ts_item = QTableWidgetItem(ts)
             ts_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             self.history_table.setItem(row, 3, ts_item)
@@ -890,29 +846,19 @@ class MainWindow(QMainWindow):
             self.history_table.setCellWidget(row, 4, view_btn)
 
     def load_history_session_item(self, item):
-        row = self.history_table.row(item)
+        row     = self.history_table.row(item)
         id_item = self.history_table.item(row, 0)
         if id_item:
             self.load_history_by_id(id_item.data(Qt.ItemDataRole.UserRole))
 
     def load_history_by_id(self, req_id: str):
-        """
-        Load a historical session into the discover view.
-
-        Uses _schedule_refresh() instead of refresh_table() so the table
-        rebuild is deferred to the batch timer — avoids blocking the main
-        thread when a session has hundreds of devices.
-        """
         self.active_session_id = req_id
         self.show_view("discover")
         self.update_stats()
-        # Deferred, non-blocking table build
         self._schedule_refresh()
         self.export_btn.setEnabled(True)
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # Export
-    # ─────────────────────────────────────────────────────────────────────────
+    # ── Export ────────────────────────────────────────────────────────────────
 
     def export_csv(self):
         if not self.active_session_id:
@@ -930,12 +876,15 @@ class MainWindow(QMainWindow):
                 with open(path, "w", newline="", encoding="utf-8") as f:
                     writer = csv.DictWriter(f, fieldnames=[
                         "hostname", "mac", "ip", "username", "building", "room",
-                        "type", "relay_host", "vendor", "timestamp",
-                        "connection_type", "port", "switch_name", "router_name",
-                        "additional_ports",
+                        "type", "relay_host", "relay_building", "relay_room",
+                        "vendor", "timestamp", "connection_type",
+                        "port", "switch_name", "router_name", "additional_ports",
                     ], extrasaction="ignore")
                     writer.writeheader()
                     for d in session["devices"]:
-                        writer.writerow(d)
+                        row = dict(d)
+                        row["vendor"]    = _resolve_vendor(d.get("mac",""), d.get("vendor",""))
+                        row["timestamp"] = _utc_to_local(d.get("timestamp",""))
+                        writer.writerow(row)
             except Exception as e:
                 QMessageBox.critical(self, "Export Failed", str(e))
