@@ -1,21 +1,57 @@
 """
-qt/main_window.py  (patched v3)
+qt/main_window.py  (patched v4)
 
-Changes in this release
-───────────────────────
+Changes in this release (v4)
+─────────────────────────────
+1. Vendor fallback fixed: _resolve_vendor() now falls back to the real
+   manuf-backed lookup_vendor() (qt/logic.py) instead of the tiny ~40-entry
+   hardcoded _OUI dict. The small dict is now only a last-resort fallback
+   if manuf itself is unavailable.
+2. "New Session" crash fixed: _BroadcastWorker.run() previously had no way
+   to be cancelled — thread.quit()/wait(2000) did nothing useful because the
+   worker doesn't run its own Qt event loop, it just executes run() to
+   completion synchronously in the moved-to thread. If a scan was still
+   running when reset_session() was clicked, _stop_worker() would drop
+   Python's only references to the still-alive QThread/worker, which can
+   segfault the whole process once the orphaned native thread later tries
+   to emit a signal or call deleteLater() on a half-collected wrapper.
+   Fixed by:
+     - Threading a cancel_event (threading.Event) into _BroadcastWorker and
+       into scan_subnet(), checked between pings/subnets/results so a
+       cancel request actually cuts a scan short instead of running to
+       completion unattended.
+     - _stop_worker() now sets the cancel event first, and if the thread
+       still hasn't finished after the wait, it is kept in a
+       self._retiring_threads list (a real Python reference) until its
+       `finished` signal fires, instead of being silently dropped.
+
+Changes carried over from v3
+─────────────────────────────
 1. No row colours — all rows white; alternating rows via Qt stylesheet only.
 2. Timestamp displayed in local time (converted from UTC ISO string).
-3. Vendor column populated: Python-side OUI lookup with a larger table as
-   fallback when the agent sends an empty vendor string.
+3. Vendor column populated: Python-side OUI lookup as fallback when the
+   agent sends an empty vendor string.
 4. Dark-mode text visibility — QTableWidget and child items are forced to
    the palette foreground colour so text is always readable.
 5. Target widget uses QComboBox dropdown + rewritten MAC/IP inputs.
 6. Relay metadata on unmanaged hotspot devices (building/room from relay host).
+
+Changes in this release (v5)
+─────────────────────────────
+1. New "Network Map" sidebar page (qt/topology_widget.py) for tracing how
+   switches/routers/wall ports/media converters interconnect, rooted at a
+   single "Internet Entry Point" node. Nodes can be added manually or are
+   auto-populated from switch_name/router_name/port fields already present
+   on discovered devices. See qt/topology.py for the persisted graph model.
+2. Every device arrival (API report or internal ARP scan result) now also
+   feeds qt/topology.py's TopologyStore, so the map stays in sync with
+   discovery in the background without the user needing to do anything.
 """
 
 import uuid
 import time
 import csv
+import threading
 from datetime import datetime, timezone, timedelta
 
 from PyQt6.QtWidgets import (
@@ -33,9 +69,17 @@ from qt.api_server import ApiServerThread
 from qt.styles import LIGHT_STYLE, DARK_STYLE
 from qt.logic import scan_subnet, lookup_vendor
 from qt.target_widget import TargetInputWidget
+from qt.topology import TopologyStore
+from qt.topology_widget import TopologyPage
 
 
-# ── OUI vendor lookup (Python-side fallback) ──────────────────────────────────
+# ── OUI vendor lookup (Python-side LAST-RESORT fallback) ──────────────────────
+# NOTE: this small hand-curated table is now only used if the real
+# manuf-backed lookup_vendor() (qt/logic.py) is unavailable or returns
+# nothing. Previously this was checked BEFORE lookup_vendor, which is why
+# only devices matching this short list ever showed a vendor — manuf was
+# silently failing to load inside the frozen .exe (see logic.py for the fix
+# and the required PyInstaller --add-data flag).
 
 _OUI = {
     '00:50:56': 'VMware',     '00:0C:29': 'VMware',    '00:15:5D': 'Hyper-V',
@@ -61,9 +105,19 @@ _OUI = {
 
 
 def _resolve_vendor(mac: str, agent_vendor: str) -> str:
-    """Return vendor string: prefer what the agent sent, fall back to local OUI."""
+    """
+    Return vendor string, preferring (in order):
+      1. What the agent/server already sent (agent_vendor).
+      2. The real manuf-backed lookup_vendor() — full IEEE OUI database.
+      3. The small hardcoded _OUI dict, only as an absolute last resort.
+    """
     if agent_vendor and agent_vendor.strip():
         return agent_vendor.strip()
+
+    vendor = lookup_vendor(mac)
+    if vendor:
+        return vendor
+
     if mac and len(mac) >= 8:
         prefix = mac[:8].upper()
         return _OUI.get(prefix, '')
@@ -253,23 +307,45 @@ class _BroadcastWorker(QObject):
     finished     = pyqtSignal()
 
     def __init__(self, broadcaster, store, session_id: str,
-                 mode: str = "full", target: str = ""):
+                 mode: str = "full", target: str = "",
+                 cancel_event: "threading.Event | None" = None):
         super().__init__()
         self._broadcaster = broadcaster
         self._store       = store
         self._session_id  = session_id
         self._mode        = mode
         self._target      = target
+        self._cancel      = cancel_event if cancel_event is not None else threading.Event()
+
+    def cancel(self):
+        """Request cooperative cancellation. Checked at multiple points in run()."""
+        self._cancel.set()
 
     def run(self):
         try:
             self._broadcaster.broadcast(self._session_id, self._mode, self._target)
+            if self._cancel.is_set():
+                return
+
             if self._mode == "full":
-                time.sleep(3.0)
+                # Sleep in small increments instead of one blocking 3s call,
+                # so a cancel request is noticed quickly rather than only
+                # after the full sleep elapses.
+                for _ in range(30):
+                    if self._cancel.is_set():
+                        return
+                    time.sleep(0.1)
+
                 networks = self._broadcaster.get_scan_networks()
                 for net in networks:
-                    found = scan_subnet(net)
+                    if self._cancel.is_set():
+                        return
+                    found = scan_subnet(net, cancel_event=self._cancel)
+                    if self._cancel.is_set():
+                        return
                     for ip, mac in found.items():
+                        if self._cancel.is_set():
+                            return
                         device = {
                             "hostname":    f"Unmanaged-{ip}",
                             "mac":         mac,
@@ -308,12 +384,19 @@ class MainWindow(QMainWindow):
 
         self.store       = ResultStore()
         self.broadcaster = DiscoveryBroadcaster(self.store)
+        self.topology_store = TopologyStore()
         self.active_session_id = None
         self.current_filter    = "all"
         self.is_dark_mode      = False
 
         self._worker_thread: QThread | None = None
         self._worker: _BroadcastWorker | None = None
+        self._worker_cancel: "threading.Event | None" = None
+        # Threads that didn't finish within the grace period on reset — kept
+        # here with a real Python reference until their `finished` signal
+        # fires, instead of being dropped (which risked a native crash; see
+        # module docstring at the top of this file for the full story).
+        self._retiring_threads: list = []
 
         self.api_thread = ApiServerThread(self.store)
         self.api_thread.device_reported.connect(self.on_device_reported)
@@ -346,6 +429,7 @@ class MainWindow(QMainWindow):
         for key, text in [
             ("discover", "◈ Discover Devices"),
             ("ranges",   "⊞ Broadcast Ranges"),
+            ("topology", "🕸 Network Map"),
             ("history",  "◷ Session History"),
         ]:
             btn = QPushButton(text)
@@ -370,6 +454,7 @@ class MainWindow(QMainWindow):
 
         self._init_discover_view()
         self._init_ranges_view()
+        self._init_topology_view()
         self._init_history_view()
 
     # ── Discover view ─────────────────────────────────────────────────────────
@@ -544,6 +629,12 @@ class MainWindow(QMainWindow):
         self.content_stack.addWidget(page)
         self.refresh_ranges_list()
 
+    # ── Network Map (topology) view ──────────────────────────────────────────
+
+    def _init_topology_view(self):
+        self.topology_page = TopologyPage(self.topology_store, self.store)
+        self.content_stack.addWidget(self.topology_page)
+
     # ── History view ──────────────────────────────────────────────────────────
 
     def _init_history_view(self):
@@ -577,9 +668,12 @@ class MainWindow(QMainWindow):
         elif key == "ranges":
             self.refresh_ranges_list()
             self.content_stack.setCurrentIndex(1)
+        elif key == "topology":
+            self.topology_page.refresh()
+            self.content_stack.setCurrentIndex(2)
         elif key == "history":
             self.refresh_history_list()
-            self.content_stack.setCurrentIndex(2)
+            self.content_stack.setCurrentIndex(3)
 
     def toggle_theme(self):
         self.is_dark_mode = not self.is_dark_mode
@@ -605,25 +699,52 @@ class MainWindow(QMainWindow):
     # ── Session management ────────────────────────────────────────────────────
 
     def reset_session(self):
-        self._stop_worker()
-        self.countdown_timer.stop()
-        self._batch_timer.stop()
-        self.progress_panel.hide()
-        self.active_session_id = None
-        self.current_filter = "all"
-        for card in self.stat_cards.values():
-            card.set_count(0)
-        self.chips_bar.reset()
-        self.table.setRowCount(0)
-        self.export_btn.setEnabled(False)
-        self.search_input.clear()
+        # Disable immediately to prevent double-clicks re-entering
+        # _stop_worker while a previous cancellation is still settling.
+        self.reset_btn.setEnabled(False)
+        try:
+            self._stop_worker()
+            self.countdown_timer.stop()
+            self._batch_timer.stop()
+            self.progress_panel.hide()
+            self.active_session_id = None
+            self.current_filter = "all"
+            for card in self.stat_cards.values():
+                card.set_count(0)
+            self.chips_bar.reset()
+            self.table.setRowCount(0)
+            self.export_btn.setEnabled(False)
+            self.search_input.clear()
+        finally:
+            QTimer.singleShot(50, lambda: self.reset_btn.setEnabled(True))
 
     def _stop_worker(self):
+        """
+        Request cancellation and wait briefly for the worker thread to stop.
+
+        If it hasn't stopped within the grace period (e.g. mid-ping-sweep),
+        we do NOT drop our only reference to it — that previously left an
+        orphaned native thread that could crash the process when it later
+        tried to emit a signal or get cleaned up. Instead we keep it in
+        self._retiring_threads until its `finished` signal actually fires.
+        """
         if self._worker_thread and self._worker_thread.isRunning():
+            if self._worker:
+                self._worker.cancel()
             self._worker_thread.quit()
-            self._worker_thread.wait(2000)
+            if not self._worker_thread.wait(2000):
+                t = self._worker_thread
+                self._retiring_threads.append(t)
+
+                def _on_retired(t=t):
+                    if t in self._retiring_threads:
+                        self._retiring_threads.remove(t)
+
+                t.finished.connect(_on_retired)
+
         self._worker_thread = None
         self._worker = None
+        self._worker_cancel = None
 
     def start_full_discovery(self):
         self.reset_session()
@@ -651,8 +772,9 @@ class MainWindow(QMainWindow):
 
     def _launch_worker(self, mode: str, target: str = ""):
         self._stop_worker()
+        cancel_event = threading.Event()
         worker = _BroadcastWorker(self.broadcaster, self.store,
-                                  self.active_session_id, mode, target)
+                                  self.active_session_id, mode, target, cancel_event)
         thread = QThread(self)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
@@ -662,6 +784,7 @@ class MainWindow(QMainWindow):
         thread.finished.connect(thread.deleteLater)
         self._worker        = worker
         self._worker_thread = thread
+        self._worker_cancel = cancel_event
         thread.start()
 
     # ── Countdown ─────────────────────────────────────────────────────────────
@@ -688,12 +811,16 @@ class MainWindow(QMainWindow):
 
     @pyqtSlot(str, dict)
     def on_device_reported(self, req_id: str, device: dict):
+        self.topology_store.sync_from_devices([device])
+        self.topology_page.mark_dirty()
         if req_id == self.active_session_id:
             self.update_stats()
             self._schedule_refresh()
 
     @pyqtSlot(str, dict)
     def _on_arp_device(self, req_id: str, device: dict):
+        self.topology_store.sync_from_devices([device])
+        self.topology_page.mark_dirty()
         if req_id == self.active_session_id:
             self.update_stats()
             self._schedule_refresh()

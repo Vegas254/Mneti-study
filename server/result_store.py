@@ -22,6 +22,16 @@ as "unmanaged" if the ARP scan happens to run first), add_result()
 upgrades an existing entry in place whenever a higher-priority report
 for the same MAC arrives — regardless of arrival order. This guarantees
 each device appears exactly once, with its best-known classification.
+
+FIX (this release): equal-priority reports used to always be dropped as
+duplicates, even when the new report carried richer data than the one
+already stored. Concretely: a bare ARP-only "unmanaged" record (no
+relay_host, no connection_type) could permanently shadow a later
+"unmanaged" report that DOES carry relay_host/connection_type=Hotspot
+from the agent's relay path — leaving a hotspot-tethered device stuck
+showing as plain "Unmanaged" with a blank Connection column instead of
+moving into the "Unmanaged Hotspot" bucket. Equal-priority reports that
+add a relay_host the existing record didn't have now upgrade too.
 """
 import os
 import json
@@ -42,8 +52,9 @@ _HISTORY_FILE = os.path.join(_DATA_DIR, "history.json")
 _MAX_HISTORY = 200
 
 # Higher number = higher priority. A later report only replaces an
-# existing one if its priority is strictly greater (equal priority is
-# treated as a duplicate and dropped, preserving the original record).
+# existing one if its priority is strictly greater, UNLESS it's an
+# equal-priority report that adds relay metadata the existing record
+# didn't have (see FIX note above).
 _TYPE_PRIORITY = {
     "unmanaged": 0,
     "relayed":   1,
@@ -152,13 +163,19 @@ class ResultStore:
         """
         Add a device report to a session, or upgrade an existing entry for
         the same MAC if the new report has a higher-priority type
-        (unmanaged < relayed < managed).
+        (unmanaged < relayed < managed), OR if it's an equal-priority report
+        that adds relay metadata (relay_host) the existing record lacked.
 
         - No existing entry for this MAC → append as a new device.
         - Existing entry with LOWER priority than the new report →
           replace it in place (upgrade), preserving its position.
-        - Existing entry with EQUAL or HIGHER priority → drop the new
-          report as a duplicate.
+        - Existing entry with EQUAL priority but no relay_host, and the new
+          report HAS a relay_host → upgrade (this is the fix: a bare
+          ARP-only "unmanaged" record no longer permanently shadows a
+          richer hotspot-relayed "unmanaged" report for the same MAC).
+        - Existing entry with EQUAL priority and no new information, or
+          HIGHER priority than the new report → drop the new report as a
+          duplicate.
 
         Devices with no MAC (blank-MAC unmanaged devices, e.g. phones/IoT
         discovered without ARP) are never deduplicated/upgraded — they are
@@ -180,14 +197,18 @@ class ResultStore:
 
                     existing_prio = _type_priority(existing.get("type", ""))
                     new_prio      = _type_priority(device.get("type", ""))
+                    gains_relay_info = (
+                        not existing.get("relay_host") and device.get("relay_host")
+                    )
 
-                    if new_prio > existing_prio:
+                    if new_prio > existing_prio or (new_prio == existing_prio and gains_relay_info):
                         session["devices"][i] = device
                         session["last_activity"] = time.monotonic()
                         self._upsert_history_locked(session)
                         log.info(
-                            "Upgraded device %s: %s -> %s (id=%s)",
-                            mac, existing.get("type"), device.get("type"), request_id
+                            "Upgraded device %s: %s -> %s (id=%s)%s",
+                            mac, existing.get("type"), device.get("type"), request_id,
+                            " [gained relay info]" if gains_relay_info else ""
                         )
                     else:
                         log.debug(

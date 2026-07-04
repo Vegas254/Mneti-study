@@ -26,21 +26,48 @@
         relay_host/relay_building/relay_room. Those fields now carry the
         relay host's values so the dashboard can identify them correctly.
         connection_type is set to "Hotspot" for these devices.
+
+    FIX 9 - Zombie / stale-config processes (NEW)
+        Task Scheduler's default MultipleInstances policy is IgnoreNew.
+        If a prior agent process is still alive (e.g. stuck in the 30s
+        relay listener window) when Stop/Start-ScheduledTask is run, the
+        old process silently keeps running with its OLD config, and a
+        new one never actually starts. This produces the symptom of
+        config edits (wall port -> switch -> different switch name)
+        never taking effect, or "flip-flopping" between old values,
+        because multiple stale processes are all still bound to UDP 5000
+        (ReuseAddress = true lets them coexist) and racing to respond.
+
+        Fix: Assert-SingleInstance runs at startup and force-kills any
+        other process whose command line matches this script before
+        binding the socket.
+
+    FIX 10 - Config never reloaded without a full restart (NEW)
+        $config was read once at startup and never touched again, so
+        editing config.json via Setup-Mneti.ps1 required a full
+        stop/start of the agent to take effect — and FIX 9's failure
+        mode meant that often didn't even work. Update-ConfigIfChanged
+        is now polled every $CONFIG_RELOAD_SECS seconds inside the main
+        loop and hot-swaps $config in place whenever config.json's
+        last-write time changes. No restart needed after Setup-Mneti.ps1.
 #>
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'SilentlyContinue'
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-$CONFIG_FILE     = 'C:\ProgramData\Locator\config.json'
-$LOG_FILE        = 'C:\ProgramData\Locator\agent.log'
-$UDP_PORT        = 5000
-$RELAY_HTTP_PORT = 5002
-$BUFFER_SIZE     = 4096
-$POST_TIMEOUT    = 8
-$CACHE_TTL       = 60
-$MAX_LOG_BYTES   = 5MB
-$MAX_RELAY_DEPTH = 1
+$CONFIG_FILE        = 'C:\ProgramData\Locator\config.json'
+$LOG_FILE           = 'C:\ProgramData\Locator\agent.log'
+$UDP_PORT           = 5000
+$RELAY_HTTP_PORT    = 5002
+$BUFFER_SIZE        = 4096
+$POST_TIMEOUT       = 8
+$CACHE_TTL          = 60
+$MAX_LOG_BYTES      = 5MB
+$MAX_RELAY_DEPTH    = 1
+$CONFIG_RELOAD_SECS = 15
+
+$script:LastConfigWrite = $null
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 $script:LogLock = New-Object System.Threading.Mutex($false, 'MnetiLogMutex')
@@ -67,6 +94,28 @@ function Write-Warn   { param([string]$m) Write-AgentLog 'WARN'  $m }
 function Write-Err    { param([string]$m) Write-AgentLog 'ERROR' $m }
 function Write-Debug2 { param([string]$m) Write-AgentLog 'DEBUG' $m }
 
+# ── Single-instance enforcement (FIX 9) ───────────────────────────────────────
+function Assert-SingleInstance {
+    $myPid = $PID
+    try {
+        $stale = Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
+            Where-Object {
+                $_.CommandLine -and
+                $_.CommandLine -match 'start-Mneti\.ps1' -and
+                $_.ProcessId -ne $myPid
+            }
+        foreach ($p in $stale) {
+            Write-Warn "Killing stale agent process PID $($p.ProcessId) (started $($p.CreationDate)) before starting"
+            Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
+        }
+        if ($stale) {
+            Start-Sleep -Milliseconds 750   # let UDP 5000 / relay TCP ports free up
+        }
+    } catch {
+        Write-Warn "Assert-SingleInstance check failed: $_"
+    }
+}
+
 # ── Config ────────────────────────────────────────────────────────────────────
 function Get-AgentConfig {
     if (-not (Test-Path $CONFIG_FILE)) {
@@ -81,6 +130,28 @@ function Get-AgentConfig {
         return $cfg
     } catch {
         Write-Err "Failed to parse config.json: $_"; exit 1
+    }
+}
+
+# ── Config hot-reload (FIX 10) ────────────────────────────────────────────────
+function Update-ConfigIfChanged {
+    param([ref]$ConfigRef)
+    try {
+        $item = Get-Item $CONFIG_FILE -ErrorAction Stop
+        if ($null -eq $script:LastConfigWrite -or $item.LastWriteTimeUtc -gt $script:LastConfigWrite) {
+            $newCfg = Get-Content $CONFIG_FILE -Raw -Encoding UTF8 | ConvertFrom-Json
+            $missing = @('building', 'room', 'token') | Where-Object { -not $newCfg.$_ }
+            if ($missing) {
+                Write-Warn "Config reload skipped - missing field(s): $($missing -join ', ')"
+                return
+            }
+            $ConfigRef.Value = $newCfg
+            $script:LastConfigWrite = $item.LastWriteTimeUtc
+            Write-Info ("Config reloaded: building={0} room={1} conn={2} port={3} switch={4} router={5}" -f `
+                $newCfg.building, $newCfg.room, $newCfg.connection_type, $newCfg.port, $newCfg.switch_name, $newCfg.router_name)
+        }
+    } catch {
+        Write-Warn "Config reload check failed: $_"
     }
 }
 
@@ -760,7 +831,10 @@ function Invoke-PacketHandler {
 
 # ── UDP listener loop ─────────────────────────────────────────────────────────
 function Start-AgentListener {
+    Assert-SingleInstance
+
     $config = Get-AgentConfig
+    try { $script:LastConfigWrite = (Get-Item $CONFIG_FILE).LastWriteTimeUtc } catch {}
 
     Write-Info "Mneti Agent starting - UDP listener on port $UDP_PORT"
     Write-Info "Building: $($config.building) | Room: $($config.room)"
@@ -782,10 +856,17 @@ function Start-AgentListener {
 
     $udpClient.Client.ReceiveTimeout = 1000
     $script:Running = $true
+    $lastReloadCheck = [DateTime]::Now
 
     try {
         while ($script:Running) {
             try {
+                # FIX 10: poll config.json for changes without needing a restart
+                if (([DateTime]::Now - $lastReloadCheck).TotalSeconds -ge $CONFIG_RELOAD_SECS) {
+                    Update-ConfigIfChanged -ConfigRef ([ref]$config)
+                    $lastReloadCheck = [DateTime]::Now
+                }
+
                 $remote   = New-Object System.Net.IPEndPoint([System.Net.IPAddress]::Any, 0)
                 $data     = $udpClient.Receive([ref]$remote)
                 $senderIP = $remote.Address.ToString()

@@ -12,7 +12,6 @@ import ipaddress
 import logging
 from datetime import datetime, timezone
 import psutil
-import psutil
 import concurrent.futures
 import platform
 import subprocess
@@ -81,7 +80,7 @@ class Config:
     UDP_TTL = 4
     BASE_DIR = os.path.dirname(sys.executable) if getattr(sys, 'frozen', False) else os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     DATA_DIR = os.path.join(BASE_DIR, "qt_data")
-    
+
     # Secure Token Loading (matches Flask server)
     SHARED_TOKEN = "Markcheruiyot"
     _env_path = os.path.join(BASE_DIR, ".env")
@@ -92,17 +91,54 @@ class Config:
                     if line.startswith("MNETI_TOKEN="):
                         SHARED_TOKEN = line.split("=", 1)[1].strip()
         except Exception: pass
-    
+
     # Override with env var if present
     SHARED_TOKEN = os.environ.get("MNETI_TOKEN", SHARED_TOKEN)
 
 # ── MAC Vendor Lookup ────────────────────────────────────────────────────────
+#
+# FIX: manuf.MacParser() loads its OUI database from a data file shipped
+# inside the `manuf` package. PyInstaller does NOT bundle non-.py package
+# data automatically, so inside a frozen .exe the constructor below used to
+# throw (file not found), get swallowed by a bare `except Exception`, and
+# MANUF_AVAILABLE would silently end up False forever — meaning every
+# vendor lookup returned "" no matter what. That's why only a handful of
+# devices (the ones in main_window.py's small hardcoded _OUI fallback) ever
+# showed a vendor.
+#
+# This now:
+#   1. Explicitly points MacParser at the bundled data file's expected
+#      location under PyInstaller's extraction dir (sys._MEIPASS) when frozen.
+#   2. Logs a WARNING instead of silently swallowing the failure, so this
+#      is visible in agent/app logs instead of just "a few vendors show up".
+#
+# You must also tell PyInstaller to bundle the file, e.g.:
+#   pyinstaller main.py --add-data "<venv>\Lib\site-packages\manuf\manuf;manuf"
+# (find the real source path with:
+#   python -c "import manuf, os; print(os.path.dirname(manuf.__file__))")
 
 try:
-    from manuf import manuf
-    _mac_parser = manuf.MacParser(update=False)
+    from manuf import manuf as _manuf_mod
+
+    _manuf_name = None
+    if getattr(sys, 'frozen', False):
+        _candidate = os.path.join(getattr(sys, '_MEIPASS', ''), 'manuf', 'manuf')
+        if os.path.exists(_candidate):
+            _manuf_name = _candidate
+        else:
+            log.warning(
+                "manuf data file not found at %s — vendor lookup will likely "
+                "fail unless PyInstaller bundles it via --add-data", _candidate
+            )
+
+    if _manuf_name:
+        _mac_parser = _manuf_mod.MacParser(manuf_name=_manuf_name, update=False)
+    else:
+        _mac_parser = _manuf_mod.MacParser(update=False)
+
     MANUF_AVAILABLE = True
-except Exception:
+except Exception as e:
+    log.warning("manuf vendor lookup unavailable, falling back to short OUI list: %s", e)
     _mac_parser = None
     MANUF_AVAILABLE = False
 
@@ -163,15 +199,36 @@ def _read_arp_table() -> dict:
     except Exception: pass
     return result
 
-def scan_subnet(network: ipaddress.IPv4Network, timeout: int = 2, max_workers: int = 16) -> dict:
-    """Scan a subnet using ping sweep + ARP table read (robust on Windows)."""
+def scan_subnet(network: ipaddress.IPv4Network, timeout: int = 2, max_workers: int = 16,
+                 cancel_event: "threading.Event | None" = None) -> dict:
+    """
+    Scan a subnet using ping sweep + ARP table read (robust on Windows).
+
+    cancel_event: optional threading.Event. If set before/during the scan,
+    the sweep is cut short and {} is returned. This lets a UI-driven "New
+    Session" / reset action actually interrupt a long scan instead of the
+    background thread running to completion unattended (which previously
+    could outlive the QThread object that owned it and crash the app on
+    teardown — see main_window.py _stop_worker for the corresponding fix).
+    """
     try:
         hosts = [str(h) for h in network.hosts()]
         if not hosts: return {}
-        
+        if cancel_event is not None and cancel_event.is_set():
+            return {}
+
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
-            list(ex.map(_ping, hosts))
-        
+            futures = []
+            for h in hosts:
+                if cancel_event is not None and cancel_event.is_set():
+                    break
+                futures.append(ex.submit(_ping, h))
+            if futures:
+                concurrent.futures.wait(futures, timeout=timeout * 4)
+
+        if cancel_event is not None and cancel_event.is_set():
+            return {}
+
         arp_table = _read_arp_table()
         host_set = set(hosts)
         return {ip: mac for ip, mac in arp_table.items() if ip in host_set}
@@ -230,6 +287,23 @@ class ResultStore:
         return request_id in self._sessions
 
     def add_result(self, request_id: str, device: dict):
+        """
+        Add a device report to a session, upgrading an existing entry for
+        the same MAC whenever the new report is a genuine improvement:
+
+          - Strictly higher priority (unmanaged < relayed < managed) always
+            upgrades in place.
+          - FIX: equal priority used to always be dropped as a "duplicate",
+            even when the new report carried richer data. In practice this
+            meant a bare ARP-only "unmanaged" record (no relay_host, no
+            connection_type) could permanently shadow a later "unmanaged"
+            report that DID carry relay_host/connection_type=Hotspot from
+            Invoke-SubnetRelay's Step 10 — leaving the device stuck showing
+            "Unmanaged" with a blank Connection column forever, instead of
+            moving to the "Unmanaged Hotspot" bucket. Equal-priority reports
+            that add a relay_host the existing record didn't have now upgrade
+            too.
+        """
         with self._lock:
             session = self._sessions.get(request_id)
             if not session: return
@@ -238,7 +312,11 @@ class ResultStore:
             if mac:
                 for i, existing in enumerate(session["devices"]):
                     if existing.get("mac", "").strip().lower() == mac:
-                        if _TYPE_PRIORITY.get(device["type"], 0) > _TYPE_PRIORITY.get(existing["type"], 0):
+                        new_prio = _TYPE_PRIORITY.get(device.get("type", ""), 0)
+                        old_prio = _TYPE_PRIORITY.get(existing.get("type", ""), 0)
+                        gains_relay_info = (not existing.get("relay_host")) and device.get("relay_host")
+
+                        if new_prio > old_prio or (new_prio == old_prio and gains_relay_info):
                             session["devices"][i] = device
                             session["last_activity"] = time.monotonic()
                             self._update_history_locked(session)
@@ -272,6 +350,29 @@ class ResultStore:
                 "started_at": h["started_at"],
                 "device_count": len(h["devices"])
             } for h in self._history]
+
+    def get_all_devices(self) -> list:
+        """
+        Return a de-duplicated list of every device ever reported, merged
+        across all in-memory sessions and saved history (keyed by MAC).
+
+        Used by the network topology view so it can auto-populate switches,
+        routers, and wall ports discovered by ANY past broadcast/scan —
+        not just whatever session happens to be open on the Discover tab.
+        """
+        with self._lock:
+            by_key = {}
+            for h in self._history:
+                for d in h.get("devices", []):
+                    mac = (d.get("mac") or "").strip().lower()
+                    key = mac if mac else f"nomac-{id(d)}"
+                    by_key[key] = d
+            for s in self._sessions.values():
+                for d in s.get("devices", []):
+                    mac = (d.get("mac") or "").strip().lower()
+                    key = mac if mac else f"nomac-{id(d)}"
+                    by_key[key] = d
+            return list(by_key.values())
 
     def _reap(self):
         while True:
@@ -388,10 +489,10 @@ class DiscoveryBroadcaster:
 
     def broadcast(self, request_id: str, mode="full", target: str = ""):
         ifaces = self._get_local_interfaces()
-        
+
         # Determine networks to broadcast to
         active_ranges = list(self._custom_ranges)
-        
+
         # If no custom ranges, add /25 of each interface as a fallback range
         if not active_ranges and mode == "full":
             for iface in ifaces:
@@ -405,7 +506,7 @@ class DiscoveryBroadcaster:
         for iface in ifaces:
             data = self._build_packet(request_id, mode, target, f"http://{iface['ip']}:{Config.HTTP_PORT}/api/report", False)
             self._send_udp(data, iface["broadcast"], bind_ip=iface["ip"])
-        
+
         # Send to custom (or fallback) ranges
         for r in active_ranges:
             data = self._build_packet(request_id, mode, target, f"http://{get_lan_ip()}:{Config.HTTP_PORT}/api/report", r.is_primary)
@@ -415,7 +516,7 @@ class DiscoveryBroadcaster:
         """Returns list of ipaddress.IPv4Network objects to be used for ARP scanning."""
         ifaces = self._get_local_interfaces()
         networks = []
-        
+
         # Add interface networks (using their actual mask)
         for iface in ifaces:
             try:
@@ -423,11 +524,11 @@ class DiscoveryBroadcaster:
                 net = ipaddress.IPv4Interface(f"{iface['ip']}/24").network # Default to /24 for scan if unclear
                 networks.append(net)
             except Exception: continue
-            
+
         # Add custom ranges
         for r in self._custom_ranges:
             networks.append(r.network)
-            
+
         # If no custom ranges, ensure we have the /25 fallbacks for scanning too
         if not self._custom_ranges:
             for iface in ifaces:
@@ -435,5 +536,5 @@ class DiscoveryBroadcaster:
                     net = ipaddress.IPv4Interface(f"{iface['ip']}/25").network
                     if net not in networks: networks.append(net)
                 except Exception: continue
-                
+
         return networks
