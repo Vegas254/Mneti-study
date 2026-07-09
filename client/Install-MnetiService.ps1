@@ -9,15 +9,23 @@
     with highest privileges.
 .NOTES
     Must be run as Administrator.
+
+    CHANGE: now also copies Update-MnetiAgent.ps1 (the self-update helper)
+    to C:\ProgramData\Locator alongside start-Mneti.ps1. The agent's
+    background updater launches that helper by this exact fixed path
+    whenever a verified update is staged, so it needs to be present from
+    install time — not just start-Mneti.ps1 itself.
 #>
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$TASK_NAME   = "MnetiAgent"
-$AGENT_DIR   = "C:\ProgramData\Locator"
-$AGENT_FILE  = "start-Mneti.ps1"
-$TARGET_PATH = Join-Path $AGENT_DIR $AGENT_FILE
+$TASK_NAME     = "MnetiAgent"
+$AGENT_DIR     = "C:\ProgramData\Locator"
+$AGENT_FILE    = "start-Mneti.ps1"
+$UPDATER_FILE  = "Update-MnetiAgent.ps1"
+$TARGET_PATH   = Join-Path $AGENT_DIR $AGENT_FILE
+$UPDATER_PATH  = Join-Path $AGENT_DIR $UPDATER_FILE
 
 function Write-Banner {
     Write-Host ''
@@ -46,7 +54,7 @@ if (-not (Test-Admin)) {
     exit 1
 }
 
-# 1. Create Target Directory and Copy Agent Script
+# 1. Create Target Directory and Copy Agent + Updater Scripts
 if (-not (Test-Path $AGENT_DIR)) {
     New-Item -ItemType Directory -Path $AGENT_DIR -Force | Out-Null
     Write-Host "  [+] Created directory: $AGENT_DIR" -ForegroundColor Green
@@ -60,6 +68,18 @@ if (Test-Path $sourcePath) {
 } else {
     Write-Host "  [!] WARNING: Source agent script not found in $PSScriptRoot." -ForegroundColor Yellow
     Write-Host "      Will assume it is already at $TARGET_PATH." -ForegroundColor Yellow
+}
+
+# Copy the self-update helper script to ProgramData. The agent's
+# background updater launches this by fixed path whenever it stages a
+# verified update, so it must exist alongside the agent from install time.
+$updaterSourcePath = Join-Path $PSScriptRoot $UPDATER_FILE
+if (Test-Path $updaterSourcePath) {
+    Copy-Item -Path $updaterSourcePath -Destination $UPDATER_PATH -Force
+    Write-Host "  [+] Copied update helper to $UPDATER_PATH" -ForegroundColor Green
+} else {
+    Write-Host "  [!] WARNING: $UPDATER_FILE not found in $PSScriptRoot." -ForegroundColor Yellow
+    Write-Host "      Self-update will not work until it is placed at $UPDATER_PATH." -ForegroundColor Yellow
 }
 
 # 2. Check if setup was already run
@@ -131,6 +151,16 @@ try {
         } else {
             Write-Host "  [.] Firewall rule for TCP ports 5002-5005 already exists." -ForegroundColor Gray
         }
+
+        # Allow UDP 5010 (Update announcements)
+        if (-not (Get-NetFirewallRule -Name "Mneti_UDP_5010" -ErrorAction SilentlyContinue)) {
+            New-NetFirewallRule -Name "Mneti_UDP_5010" -DisplayName "Mneti Agent Update Announcements (UDP 5010)" `
+                                -Description "Allows incoming UDP self-update broadcasts from the Mneti dashboard." `
+                                -Direction Inbound -Protocol UDP -LocalPort 5010 -Action Allow -Enabled True | Out-Null
+            Write-Host "  [+] Added firewall rule for UDP port 5010." -ForegroundColor Green
+        } else {
+            Write-Host "  [.] Firewall rule for UDP port 5010 already exists." -ForegroundColor Gray
+        }
     } else {
         # Fallback to legacy netsh commands
         netsh advfirewall firewall show rule name="Mneti Agent Discovery (UDP 5000)" > $null
@@ -146,10 +176,17 @@ try {
                 dir=in action=allow protocol=TCP localport=5002-5005 enable=yes > $null
             Write-Host "  [+] Added firewall rule for TCP ports 5002-5005 via Netsh." -ForegroundColor Green
         }
+
+        netsh advfirewall firewall show rule name="Mneti Agent Update Announcements (UDP 5010)" > $null
+        if ($LASTEXITCODE -ne 0) {
+            netsh advfirewall firewall add rule name="Mneti Agent Update Announcements (UDP 5010)" `
+                dir=in action=allow protocol=UDP localport=5010 enable=yes > $null
+            Write-Host "  [+] Added firewall rule for UDP port 5010 via Netsh." -ForegroundColor Green
+        }
     }
 } catch {
     Write-Host "  [!] WARNING: Failed to configure firewall rules: $_" -ForegroundColor Yellow
-    Write-Host "      You may need to manually open UDP port 5000 and TCP port 5002 in Windows Firewall." -ForegroundColor Yellow
+    Write-Host "      You may need to manually open UDP ports 5000/5010 and TCP port 5002 in Windows Firewall." -ForegroundColor Yellow
 }
 
 # 5. Start the Task immediately

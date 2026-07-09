@@ -3,15 +3,23 @@ qt/target_widget.py
 ~~~~~~~~~~~~~~~~~~~
 Targeted-discovery input widget for the Mneti Qt dashboard.
 
-Rewrite v3 — fixes:
+Rewrite v4 — adds a third mode:
   1. MAC input  — no zero-padding of incomplete hex pairs; cursor stays
                   exactly where the user typed; left-to-right typing works
                   naturally.
-  2. Mode selector — QComboBox dropdown ("MAC Address" / "IP Address")
-                     instead of a toggle button.
+  2. Mode selector — QComboBox dropdown ("MAC Address" / "IP Address" /
+                     "IP Range") instead of a toggle button.
   3. IP input   — single QLineEdit, not 4 split boxes.  Looks seamless.
                   Enforces digits + dots only, clamps each octet ≤ 255,
                   auto-advances the dot after you finish an octet.
+  4. IP Range input (NEW) — single QLineEdit accepting the same formats as
+                  the Broadcast Ranges tab ('10.51.144.1-254', CIDR,
+                  dotted mask, or a bare IP). Selecting this mode and
+                  hitting Search restricts the discovery broadcast + ARP
+                  scan to just that range, instead of the whole subnet —
+                  this used to be a separate always-visible field on the
+                  Discover page; it now lives here, next to MAC/IP, since
+                  it's really just a third way to say what to search for.
 """
 
 import re
@@ -21,6 +29,8 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QKeyEvent
+
+from qt.logic import parse_custom_range
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -97,26 +107,12 @@ class _MacLineEdit(QLineEdit):
         """
         full_pairs = raw_len // 2
         remainder  = raw_len % 2
-        # full_pairs pairs → full_pairs*2 hex chars + (full_pairs-1) colons
-        # but only add colon if there IS a next pair
-        pos = full_pairs * 2 + full_pairs   # hex + colons so far
+        pos = full_pairs * 2 + full_pairs
         if remainder:
-            pos += remainder                 # partial pair chars
+            pos += remainder
         else:
-            # cursor is right after a colon (or at start)
             if full_pairs > 0:
-                pos -= 1  # move back over the trailing colon we overcounted
-        # Simpler, equivalent formula that is easier to verify:
-        # display_pos = raw_len + (raw_len // 2)   when raw_len // 2 > 0 and raw_len % 2 == 0
-        # display_pos = raw_len + (raw_len // 2)   when raw_len % 2 == 1
-        # Both cases: pos = raw_len + raw_len // 2
-        # But the colon comes AFTER a complete pair, so:
-        #   raw 0 → display 0
-        #   raw 1 → display 1
-        #   raw 2 → display 3  (AA:)  ← colon inserted, cursor after it
-        #   raw 3 → display 4  (AA:B)
-        #   raw 4 → display 6  (AA:BB:)
-        # Formula: raw_len + raw_len // 2   ✓
+                pos -= 1
         return raw_len + (raw_len - 1) // 2 if raw_len > 0 else 0
 
     # ── key handling ──────────────────────────────────────────────────────────
@@ -134,7 +130,6 @@ class _MacLineEdit(QLineEdit):
         # ── Backspace ─────────────────────────────────────────────────────────
         if key == Qt.Key.Key_Backspace:
             if self.hasSelectedText():
-                # Delete selection then reformat
                 start = self.selectionStart()
                 end   = start + len(self.selectedText())
                 cur   = self.text()
@@ -147,10 +142,8 @@ class _MacLineEdit(QLineEdit):
                 pos = self.cursorPosition()
                 if pos == 0:
                     return
-                # If cursor is right after a colon, step back over it first
                 if pos > 0 and cur[pos - 1] == ':':
                     pos -= 1
-                # Now remove the hex char before pos
                 raw = self._raw(cur[:pos])
                 if not raw:
                     self._set('', 0)
@@ -173,7 +166,6 @@ class _MacLineEdit(QLineEdit):
             else:
                 cur = self.text()
                 pos = self.cursorPosition()
-                # Skip over colon
                 if pos < len(cur) and cur[pos] == ':':
                     pos += 1
                 if pos >= len(cur):
@@ -196,7 +188,6 @@ class _MacLineEdit(QLineEdit):
         if len(raw) >= 12:
             return   # already full
 
-        # If there is a selection, replace it
         if self.hasSelectedText():
             start    = self.selectionStart()
             end      = start + len(self.selectedText())
@@ -207,7 +198,6 @@ class _MacLineEdit(QLineEdit):
             self._set(new_text, len(raw_pre) + 1)
             return
 
-        # Normal insert at cursor
         pos      = self.cursorPosition()
         raw_pre  = self._raw(cur[:pos])
         raw_post = self._raw(cur[pos:])
@@ -219,7 +209,6 @@ class _MacLineEdit(QLineEdit):
         """Set display text and position cursor using the raw index."""
         self._updating = True
         self.setText(text)
-        # Compute display position from raw cursor
         disp = self._raw_to_disp(text, raw_cursor)
         self.setCursorPosition(disp)
         self._updating = False
@@ -227,10 +216,6 @@ class _MacLineEdit(QLineEdit):
 
     @staticmethod
     def _raw_to_disp(text: str, raw_idx: int) -> int:
-        """
-        Walk through `text` counting only non-colon chars until we've
-        seen `raw_idx` of them; return that display position.
-        """
         count = 0
         for i, ch in enumerate(text):
             if count == raw_idx:
@@ -301,7 +286,6 @@ class _IPLineEdit(QLineEdit):
             self.search_requested.emit()
             return
 
-        # Allow all navigation / control keys
         if key in (Qt.Key.Key_Left, Qt.Key.Key_Right, Qt.Key.Key_Home,
                    Qt.Key.Key_End, Qt.Key.Key_Backspace, Qt.Key.Key_Delete,
                    Qt.Key.Key_Tab, Qt.Key.Key_Shift):
@@ -313,12 +297,10 @@ class _IPLineEdit(QLineEdit):
             super().keyPressEvent(event)
             return
 
-        # Dot / period — only if fewer than 3 dots already and current octet non-empty
         if char == '.':
             cur = self.text()
             if cur.count('.') >= 3:
                 return
-            # Don't allow dot at start or after another dot
             pos = self.cursorPosition()
             if pos == 0 or (pos > 0 and cur[pos - 1] == '.'):
                 return
@@ -326,23 +308,19 @@ class _IPLineEdit(QLineEdit):
             return
 
         if not char.isdigit():
-            return    # swallow anything that isn't a digit or dot
+            return
 
-        # Digit — check if inserting it would violate octet rules
         cur = self.text()
         pos = self.cursorPosition()
 
-        # Find the start of the current octet
         before = cur[:pos]
         dot_pos = before.rfind('.')
-        octet_start = dot_pos + 1   # 0 if no dot found (-1 + 1)
+        octet_start = dot_pos + 1
         octet_so_far = before[octet_start:]
 
-        # Don't allow more than 3 digits in one octet
         if len(octet_so_far) >= 3:
             return
 
-        # Preview what the octet will look like after insertion
         after_in_octet = cur[pos:]
         next_dot = after_in_octet.find('.')
         octet_end_in_after = next_dot if next_dot != -1 else len(after_in_octet)
@@ -355,14 +333,10 @@ class _IPLineEdit(QLineEdit):
             val = 0
 
         if val > 255:
-            return     # would exceed 255 — block it
+            return
 
-        # Insert the digit normally
         super().keyPressEvent(event)
 
-        # After inserting, auto-advance with a dot when octet is "full":
-        # • 3 digits entered, or
-        # • value > 25 with 2 digits (can't possibly grow further without exceeding 255)
         cur2 = self.text()
         pos2 = self.cursorPosition()
         before2   = cur2[:pos2]
@@ -381,7 +355,6 @@ class _IPLineEdit(QLineEdit):
                 pass
 
         if should_dot and cur2.count('.') < 3:
-            # Only auto-dot if the cursor is at the end of the current octet
             after2 = cur2[pos2:]
             if not after2 or after2[0] == '.':
                 if not after2 or after2[0] != '.':
@@ -420,6 +393,51 @@ class _IPLineEdit(QLineEdit):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# IP Range input (NEW) — single QLineEdit, same formats as Broadcast Ranges
+# ─────────────────────────────────────────────────────────────────────────────
+
+class _RangeLineEdit(QLineEdit):
+    """
+    Free-text range entry. Accepts anything parse_custom_range() understands:
+      - '10.51.144.1-254'  (start-end, same formats as the Broadcast Ranges tab)
+      - '10.51.144.0/24'   (CIDR)
+      - '10.51.144.0/255.255.255.0'  (dotted mask)
+      - '10.51.144.7'      (single host, treated as /32)
+
+    Live validity is checked with the exact same parser the Broadcast Ranges
+    tab and the actual scan use, so "looks valid here" always means "will
+    actually parse when the search runs."
+    """
+
+    search_requested = pyqtSignal()
+
+    def __init__(self):
+        super().__init__()
+        self.setPlaceholderText("e.g.  10.51.144.1-254")
+        self.setFixedWidth(220)
+        self.setStyleSheet(
+            "QLineEdit {"
+            "  font-family: Consolas, 'Courier New', monospace;"
+            "  font-size: 13px;"
+            "  border: 1px solid #ced4da;"
+            "  border-radius: 4px;"
+            "  padding: 5px 8px;"
+            "}"
+            "QLineEdit:focus { border-color: #80bdff; }"
+        )
+        self.returnPressed.connect(self.search_requested)
+
+    def is_valid(self) -> bool:
+        text = self.text().strip()
+        if not text:
+            return False
+        return parse_custom_range(text) is not None
+
+    def get_value(self) -> str:
+        return self.text().strip()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Combined TargetInputWidget
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -431,9 +449,16 @@ class TargetInputWidget(QWidget):
       [MAC Address ▾]  [input field]  [✓/✗]  [Search]
       hint text
 
-    The mode selector is a QComboBox with two items:
-      "MAC Address"  →  _MacLineEdit
-      "IP Address"   →  _IPLineEdit
+    The mode selector is a QComboBox with three items:
+      "MAC Address"  →  _MacLineEdit    → mode() == "mac"
+      "IP Address"   →  _IPLineEdit     → mode() == "ip"
+      "IP Range"     →  _RangeLineEdit  → mode() == "range"
+
+    "IP Range" doesn't target a single device — selecting it and hitting
+    Search means "run a full discovery scan, but restricted to just this
+    range" instead of the whole subnet / saved custom ranges. The caller
+    (MainWindow.start_targeted_discovery) is responsible for routing that
+    mode differently from a MAC/IP target match.
     """
 
     search_requested = pyqtSignal()
@@ -454,6 +479,7 @@ class TargetInputWidget(QWidget):
         self._combo = QComboBox()
         self._combo.addItem("MAC Address")
         self._combo.addItem("IP Address")
+        self._combo.addItem("IP Range")
         self._combo.setFixedWidth(110)
         self._combo.setStyleSheet(
             "QComboBox {"
@@ -483,6 +509,13 @@ class TargetInputWidget(QWidget):
         self._ip_edit.hide()
         row1.addWidget(self._ip_edit)
 
+        # Range input (NEW)
+        self._range_edit = _RangeLineEdit()
+        self._range_edit.textChanged.connect(self._on_input_changed)
+        self._range_edit.search_requested.connect(self.search_requested)
+        self._range_edit.hide()
+        row1.addWidget(self._range_edit)
+
         # Validity icon
         self._valid_lbl = QLabel("")
         self._valid_lbl.setFixedWidth(18)
@@ -507,23 +540,33 @@ class TargetInputWidget(QWidget):
 
     # ── Mode switch ───────────────────────────────────────────────────────────
 
+    _HINTS = {
+        "mac":   "Format: AA:BB:CC:DD:EE:FF  (hex pairs, auto-separated)",
+        "ip":    "Enter each octet (0–255); dots are enforced automatically",
+        "range": "Range, CIDR, dotted mask, or single IP — e.g. 10.51.144.1-254 "
+                 "or 10.51.144.0/24. Search restricts the scan to just this range.",
+    }
+    _MODE_BY_INDEX = {0: "mac", 1: "ip", 2: "range"}
+
     def _on_combo_changed(self, index: int):
-        self._mode = "mac" if index == 0 else "ip"
-        is_mac = self._mode == "mac"
-        self._mac_edit.setVisible(is_mac)
-        self._ip_edit.setVisible(not is_mac)
+        self._mode = self._MODE_BY_INDEX.get(index, "mac")
+
+        self._mac_edit.setVisible(self._mode == "mac")
+        self._ip_edit.setVisible(self._mode == "ip")
+        self._range_edit.setVisible(self._mode == "range")
+
         self._valid_lbl.setText("")
-        self._hint_lbl.setText(
-            "Format: AA:BB:CC:DD:EE:FF  (hex pairs, auto-separated)"
-            if is_mac else
-            "Enter each octet (0–255); dots are enforced automatically"
-        )
-        if is_mac:
+        self._hint_lbl.setText(self._HINTS[self._mode])
+
+        if self._mode == "mac":
             self._mac_edit.clear()
             self._mac_edit.setFocus()
-        else:
+        elif self._mode == "ip":
             self._ip_edit.clear()
             self._ip_edit.setFocus()
+        else:
+            self._range_edit.clear()
+            self._range_edit.setFocus()
 
     # ── Validation indicator ──────────────────────────────────────────────────
 
@@ -542,17 +585,21 @@ class TargetInputWidget(QWidget):
     def _is_valid(self) -> bool:
         if self._mode == "mac":
             return self._mac_edit.is_valid()
-        return self._ip_edit.is_valid()
+        if self._mode == "ip":
+            return self._ip_edit.is_valid()
+        return self._range_edit.is_valid()
 
     def _current_raw(self) -> str:
         if self._mode == "mac":
             return self._mac_edit.text()
-        return self._ip_edit.text()
+        if self._mode == "ip":
+            return self._ip_edit.text()
+        return self._range_edit.text()
 
     # ── Public API ────────────────────────────────────────────────────────────
 
     def mode(self) -> str:
-        """Return 'mac' or 'ip'."""
+        """Return 'mac', 'ip', or 'range'."""
         return self._mode
 
     def is_valid(self) -> bool:
@@ -564,7 +611,9 @@ class TargetInputWidget(QWidget):
             return None
         if self._mode == "mac":
             return self._mac_edit.get_value()
-        return self._ip_edit.get_value()
+        if self._mode == "ip":
+            return self._ip_edit.get_value()
+        return self._range_edit.get_value()
 
     def raw_value(self) -> str:
         return self._current_raw()
@@ -572,4 +621,5 @@ class TargetInputWidget(QWidget):
     def clear(self):
         self._mac_edit.clear()
         self._ip_edit.clear()
+        self._range_edit.clear()
         self._valid_lbl.setText("")

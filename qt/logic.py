@@ -383,6 +383,58 @@ class ResultStore:
                 for rid in expired:
                     self._sessions.pop(rid)
 
+
+class IPHistoryResultStore:
+    """
+    Separate session store for "ip_history" query broadcasts.
+
+    Deliberately does NOT dedupe/merge by MAC the way ResultStore does —
+    a single "what IPs did this computer have on this day" query can
+    legitimately produce several rows from the same MAC (one per logged
+    IP change), and all of them need to reach the table.
+
+    Nothing is written to disk here: each session only lives as long as
+    the dashboard is waiting on replies to one specific query broadcast.
+    The durable data lives in each agent's own local ip_history.jsonl —
+    this store is purely an in-memory mailbox for one round of replies.
+    """
+    def __init__(self, ttl: int = Config.RESULT_TTL):
+        self._ttl = ttl
+        self._lock = threading.Lock()
+        self._sessions = {}
+        threading.Thread(target=self._reap, daemon=True).start()
+
+    def init_session(self, request_id: str):
+        with self._lock:
+            self._sessions[request_id] = {
+                "devices": [],
+                "expires_at": time.monotonic() + self._ttl,
+            }
+
+    def session_exists(self, request_id: str) -> bool:
+        return request_id in self._sessions
+
+    def add_result(self, request_id: str, device: dict):
+        with self._lock:
+            session = self._sessions.get(request_id)
+            if session:
+                session["devices"].append(device)
+
+    def get_session(self, request_id: str) -> dict | None:
+        with self._lock:
+            session = self._sessions.get(request_id)
+            return dict(session) if session else None
+
+    def _reap(self):
+        while True:
+            time.sleep(60)
+            now = time.monotonic()
+            with self._lock:
+                expired = [rid for rid, s in self._sessions.items() if s["expires_at"] < now]
+                for rid in expired:
+                    self._sessions.pop(rid)
+
+
 # ── Broadcaster ─────────────────────────────────────────────────────────────
 
 class ParsedRange:
@@ -460,7 +512,16 @@ class DiscoveryBroadcaster:
         data = self._build_packet(request_id, mode, target, callback_url, pr.is_primary)
         self._send_udp(data, pr.broadcast)
 
-    def _build_packet(self, request_id: str, mode: str, target: str, callback_url: str, is_primary: bool = False):
+    def _build_packet(self, request_id: str, mode: str, target: str, callback_url: str,
+                       is_primary: bool = False, iph_mode: str = "", iph_start: str = "",
+                       iph_end: str = "", iph_ip: str = ""):
+        """
+        Field order matters: it must exactly match the canonical string the
+        PowerShell agent reconstructs in Test-Packet/Build-RelayPacket for
+        HMAC verification. iph_* fields are always present (blank string
+        when this isn't an ip_history query) so the signature covers them
+        even for ordinary full/targeted broadcasts.
+        """
         packet = {
             "request_id": request_id,
             "mode": mode,
@@ -470,6 +531,10 @@ class DiscoveryBroadcaster:
             "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "relay_depth": 0,
             "is_primary": is_primary,
+            "iph_mode": iph_mode,
+            "iph_start": iph_start,
+            "iph_end": iph_end,
+            "iph_ip": iph_ip,
         }
         payload = json.dumps(packet, separators=(",", ":")).encode()
         sig = hmac.new(Config.SHARED_TOKEN.encode(), payload, hashlib.sha256).hexdigest()
@@ -510,6 +575,48 @@ class DiscoveryBroadcaster:
         # Send to custom (or fallback) ranges
         for r in active_ranges:
             data = self._build_packet(request_id, mode, target, f"http://{get_lan_ip()}:{Config.HTTP_PORT}/api/report", r.is_primary)
+            self._send_udp(data, r.broadcast)
+
+    def broadcast_to_ranges(self, request_id: str, mode: str, target: str, range_strings: list):
+        """
+        Ad-hoc, non-persisted broadcast restricted to one or more ranges
+        (accepts the same formats as the Broadcast Ranges tab:
+        '10.51.144.1-254', CIDR, dotted mask, or a bare IP). Used by
+        targeted/full discovery when the user wants to scan a subset
+        instead of the whole subnet — does not touch or read the saved
+        custom ranges list.
+
+        Returns True if at least one range string parsed and was sent.
+        """
+        callback_url = f"http://{get_lan_ip()}:{Config.HTTP_PORT}/api/report"
+        sent_any = False
+        for raw in range_strings:
+            pr = parse_custom_range(raw)
+            if not pr:
+                continue
+            data = self._build_packet(request_id, mode, target, callback_url, pr.is_primary)
+            self._send_udp(data, pr.broadcast)
+            sent_any = True
+        return sent_any
+
+    def send_ip_history_query(self, request_id: str, iph_mode: str, iph_start: str,
+                               iph_end: str, iph_ip: str = ""):
+        """
+        Broadcasts an "ip_history" query. This never touches or streams
+        any log data itself — it only sends the small signed query packet;
+        each agent decides locally whether/what to reply with by reading
+        its own ip_history.jsonl (see Get-IpHistoryMatches in the agent).
+        """
+        ifaces = self._get_local_interfaces()
+        for iface in ifaces:
+            data = self._build_packet(
+                request_id, "ip_history", "", f"http://{iface['ip']}:{Config.HTTP_PORT}/api/report",
+                False, iph_mode, iph_start, iph_end, iph_ip)
+            self._send_udp(data, iface["broadcast"], bind_ip=iface["ip"])
+        for r in self._custom_ranges:
+            data = self._build_packet(
+                request_id, "ip_history", "", f"http://{get_lan_ip()}:{Config.HTTP_PORT}/api/report",
+                r.is_primary, iph_mode, iph_start, iph_end, iph_ip)
             self._send_udp(data, r.broadcast)
 
     def get_scan_networks(self):
