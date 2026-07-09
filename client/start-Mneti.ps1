@@ -96,7 +96,7 @@ $CONFIG_RELOAD_SECS = 15
 # Bump this with every release you deploy via "Deploy Update" in the
 # dashboard. Agents ignore any announced update_version that is not
 # strictly newer than this, so a stale/duplicate broadcast is a no-op.
-$AGENT_VERSION       = '1.0.0'
+$AGENT_VERSION       = '1.2.0'
 $UPDATE_UDP_PORT     = 5010
 $UPDATE_MAGIC        = 'MNETI_UPDATE'
 $UPDATE_PROTO_MAX    = 1
@@ -107,6 +107,17 @@ $UPDATE_TASK_NAME    = 'MnetiAgent'
 $UPDATE_ID_CACHE_TTL = 300
 $UPDATE_CONNECT_JITTER_MS_MAX = 3000
 
+# ── Daisy-chain update relay (FIX 14) ───────────────────────────────────────
+# After a hotspotting device applies an update to itself, it re-announces
+# the SAME update (same version/sha256/transfer_id) into whichever subnets
+# it hotspots — mirroring the discovery relay pattern (Get-RelayNetworks) —
+# and serves the file itself over TCP, so every device behind it updates
+# without ever needing to reach the dashboard/server directly.
+$UPDATE_RELAY_MARKER     = 'C:\ProgramData\Locator\update\relay_marker.json'
+$UPDATE_RELAY_PAYLOAD    = 'C:\ProgramData\Locator\update\relay_payload.ps1'
+$UPDATE_RELAY_TCP_PORT   = 5310
+$UPDATE_RELAY_SERVE_SECS = 45
+
 $script:LastConfigWrite = $null
 $script:LastKnownIPs    = @()
 # Synchronized hashtable — safely shared between the main thread and the
@@ -114,6 +125,12 @@ $script:LastKnownIPs    = @()
 # download never stalls the UDP receive loop. See Start-BackgroundUpdate.
 $script:UpdateState = [hashtable]::Synchronized(@{ PendingRestart = $false; Message = '' })
 $script:SeenUpdateIds = New-Object 'System.Collections.Concurrent.ConcurrentDictionary[string,long]'
+
+# ── Background runspace registry (FIX 2) ─────────────────────────────────────
+# Keeps references to background PowerShell runspaces so they are not
+# garbage-collected before they complete. Added for Invoke-PendingUpdateRelay
+# and Start-BackgroundUpdate.
+$script:BackgroundRunspaces = New-Object System.Collections.ArrayList
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 $script:LogLock = New-Object System.Threading.Mutex($false, 'MnetiLogMutex')
@@ -140,23 +157,18 @@ function Write-Warn   { param([string]$m) Write-AgentLog 'WARN'  $m }
 function Write-Err    { param([string]$m) Write-AgentLog 'ERROR' $m }
 function Write-Debug2 { param([string]$m) Write-AgentLog 'DEBUG' $m }
 
-# ── Single-instance enforcement (FIX 9) ───────────────────────────────────────
+# ── Single-instance enforcement (FIX 9 + FIX 1) ──────────────────────────────
 function Assert-SingleInstance {
     $myPid = $PID
     try {
         $stale = Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
-            Where-Object {
-                $_.CommandLine -and
-                $_.CommandLine -match 'start-Mneti\.ps1' -and
-                $_.ProcessId -ne $myPid
-            }
+            Where-Object { $_.CommandLine -and $_.CommandLine -match 'start-Mneti\.ps1' -and $_.ProcessId -ne $myPid }
         foreach ($p in $stale) {
-            Write-Warn "Killing stale agent process PID $($p.ProcessId) (started $($p.CreationDate)) before starting"
+            $age = (Get-Date) - $p.CreationDate
+            if ($age.TotalSeconds -lt 5) { continue }   # avoid killing a process that just started
             Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
         }
-        if ($stale) {
-            Start-Sleep -Milliseconds 750   # let UDP 5000 / relay TCP ports free up
-        }
+        if ($stale) { Start-Sleep -Milliseconds 750 }
     } catch {
         Write-Warn "Assert-SingleInstance check failed: $_"
     }
@@ -327,7 +339,6 @@ function Get-NetworkAdapters {
                     PrefixLength   = $addr.PrefixLength
                     InterfaceType  = $adapter.InterfaceType
                 }
-                Write-Debug2 "Adapter included: $($adapter.Name) IP=$ip/$($addr.PrefixLength) [type=$($adapter.InterfaceType)]"
             }
         }
     } catch { Write-Warn "Adapter enumeration error: $_" }
@@ -657,7 +668,7 @@ function Invoke-SubnetRelay {
 
     Write-Info "Relaying discovery into $localIP/$prefix via $broadcastAddr"
 
-    # Step 1: Ping sweep to seed ARP cache
+    # Ping sweep to seed ARP cache
     Write-Info "Ping sweep (ARP seed) on $localIP/$prefix ..."
     try {
         $si = Get-SubnetInfo -IP $localIP -PrefixLength $prefix
@@ -674,11 +685,11 @@ function Invoke-SubnetRelay {
         Start-Sleep -Milliseconds 800
     } catch { Write-Warn "Ping sweep failed on $localIP/$prefix : $_" }
 
-    # Step 2: Read ARP before listener starts
+    # ARP pre-scan
     $arpHosts = Get-ArpHostsInSubnet -LocalIP $localIP -PrefixLength $prefix -ExcludeIP $localIP
     Write-Info "ARP pre-scan: $(@($arpHosts.Keys).Count) host(s) known on $localIP/$prefix"
 
-    # Step 3: Start relay HTTP listener
+    # Start relay HTTP listener
     $listener        = $null
     $listenerStarted = $false
     $relayPort       = $null
@@ -708,7 +719,7 @@ function Invoke-SubnetRelay {
     }
 
     try {
-        # Step 4: Build relay packet
+        # Build relay packet
         Write-Info "Building relay packet with callback URL: $localCallbackUrl"
         $packetBytes = Build-RelayPacket `
             -OriginalPayload  $Packet `
@@ -716,7 +727,7 @@ function Invoke-SubnetRelay {
             -Token            $Config.token `
             -RelayDepth       $newDepth
 
-        # Step 5: Unicast to ARP-known hosts first
+        # Unicast to ARP-known hosts
         foreach ($arpIP in $arpHosts.Keys) {
             try {
                 $udpUnicast = New-Object System.Net.Sockets.UdpClient
@@ -727,7 +738,7 @@ function Invoke-SubnetRelay {
             } catch { Write-Warn "Unicast to $arpIP failed: $_" }
         }
 
-        # Step 6: Subnet broadcast
+        # Subnet broadcast
         try {
             $udpBcast = New-Object System.Net.Sockets.UdpClient
             $udpBcast.EnableBroadcast = $true
@@ -736,7 +747,7 @@ function Invoke-SubnetRelay {
             Write-Info "Rebroadcasting discovery to ${broadcastAddr}:$UDP_PORT (depth $newDepth)"
         } catch { Write-Warn "UDP rebroadcast to $broadcastAddr failed: $_" }
 
-        # Step 7: Collect managed responses (30 s window)
+        # Collect managed responses (30 s window)
         $managedReports = @()
         $deadline       = [DateTime]::Now.AddSeconds(30)
 
@@ -775,11 +786,11 @@ function Invoke-SubnetRelay {
 
         Write-Info "Relay listener completed. Managed responses: $(@($managedReports).Count)"
 
-        # Step 8: Re-read ARP after window
+        # Re-read ARP after window
         $arpHostsFinal = Get-ArpHostsInSubnet -LocalIP $localIP -PrefixLength $prefix -ExcludeIP $localIP
         Write-Info "ARP scan found $(@($arpHostsFinal.Keys).Count) device(s) in $localIP/$prefix"
 
-        # Step 9: Forward managed/relayed reports to Flask server
+        # Forward managed/relayed reports – bind to $localIP
         $managedMacs = @{}
         foreach ($mr in $managedReports) {
             $mac = $mr.mac.ToUpper() -replace '-', ':'
@@ -805,13 +816,11 @@ function Invoke-SubnetRelay {
                 switch_name    = $mr.switch_name
                 router_name    = $mr.router_name
             }
+            # FIX: bind to the relay interface's IP
             Send-Report -CallbackUrl $Packet.callback_url -Report $relayReport -Token $Config.token -SourceIP $localIP
-            Write-Info "POSTing to $CallbackUrl"
         }
 
-        # Step 10: Report ARP-only (unmanaged) devices
-        # FIX 8: Populate relay_host/building/room so the dashboard can identify
-        # these as hotspot-relayed devices. connection_type is set to "Hotspot".
+        # Report unmanaged devices – bind to $localIP
         foreach ($arpIP in $arpHostsFinal.Keys) {
             $arpMac = $arpHostsFinal[$arpIP]
             if ($managedMacs.ContainsKey($arpMac)) { continue }
@@ -842,6 +851,7 @@ function Invoke-SubnetRelay {
                 switch_name    = ''
                 router_name    = ''
             }
+            # FIX: bind to the relay interface's IP
             Send-Report -CallbackUrl $Packet.callback_url -Report $unmanagedReport -Token $Config.token -SourceIP $localIP
         }
 
@@ -1184,10 +1194,13 @@ function Start-BackgroundUpdate {
             Move-Item -Path $tmpPath -Destination $pendingPath -Force
 
             $marker = [ordered]@{
-                update_version = $UpdateVersion
-                transfer_id    = $TransferId
-                target         = $TargetPath
-                staged_at      = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+                update_version   = $UpdateVersion
+                transfer_id      = $TransferId
+                target           = $TargetPath
+                staged_at        = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+                sha256           = $ExpectedSha256
+                file_size        = $FileSize
+                origin_sender_ip = $HostIp
             }
             $marker | ConvertTo-Json -Compress | Set-Content -Path (Join-Path $UpdateDir 'pending.json') -Encoding UTF8 -Force
 
@@ -1219,6 +1232,8 @@ function Start-BackgroundUpdate {
     # the same process. We intentionally don't keep/await the handle — the
     # scriptblock signals completion via $script:UpdateState instead.
     [void]$ps.BeginInvoke()
+    # FIX 2: Keep a reference to the PowerShell object so it isn't garbage-collected.
+    $null = $script:BackgroundRunspaces.Add($ps)
 }
 
 function Invoke-UpdatePacket {
@@ -1257,34 +1272,343 @@ function Invoke-UpdatePacket {
         -MyPid $PID
 }
 
+# ── Daisy-chain update relay (FIX 14) ─────────────────────────────────────────
+function Invoke-PendingUpdateRelay {
+    param([object]$Config)
+
+    if (-not (Test-Path $UPDATE_RELAY_MARKER)) { 
+        Write-Info "No update relay marker found - skipping daisy-chain"
+        return 
+    }
+
+    if (-not (Test-Path $UPDATE_RELAY_PAYLOAD)) {
+        Write-Warn "Update relay marker present but payload file missing - discarding marker"
+        Remove-Item -Path $UPDATE_RELAY_MARKER -Force -ErrorAction SilentlyContinue
+        return
+    }
+
+    try {
+        $marker = Get-Content $UPDATE_RELAY_MARKER -Raw -Encoding UTF8 | ConvertFrom-Json
+    } catch {
+        Write-Warn "Update relay marker unreadable - discarding: $_"
+        Remove-Item -Path $UPDATE_RELAY_MARKER  -Force -ErrorAction SilentlyContinue
+        Remove-Item -Path $UPDATE_RELAY_PAYLOAD -Force -ErrorAction SilentlyContinue
+        return
+    }
+
+    if (-not $marker.origin_sender_ip -or -not $marker.sha256 -or -not $marker.file_size -or -not $marker.update_version) {
+        Write-Warn "Update relay marker missing required field(s) - discarding"
+        Remove-Item -Path $UPDATE_RELAY_MARKER  -Force -ErrorAction SilentlyContinue
+        Remove-Item -Path $UPDATE_RELAY_PAYLOAD -Force -ErrorAction SilentlyContinue
+        return
+    }
+
+    # Re-verify the payload on disk
+    $payloadBytes = $null
+    try {
+        $actualHash = (Get-FileHash -Path $UPDATE_RELAY_PAYLOAD -Algorithm SHA256).Hash.ToLower()
+        if ($actualHash -ne ([string]$marker.sha256).ToLower()) {
+            Write-Warn "Update relay payload hash mismatch - refusing to relay, discarding"
+            Remove-Item -Path $UPDATE_RELAY_MARKER, $UPDATE_RELAY_PAYLOAD -Force -ErrorAction SilentlyContinue
+            return
+        }
+        $payloadBytes = [System.IO.File]::ReadAllBytes($UPDATE_RELAY_PAYLOAD)
+        Write-Info "Update relay payload verified: $($payloadBytes.Length) bytes, SHA256 matches"
+    } catch {
+        Write-Warn "Update relay payload check failed - discarding: $_"
+        Remove-Item -Path $UPDATE_RELAY_MARKER, $UPDATE_RELAY_PAYLOAD -Force -ErrorAction SilentlyContinue
+        return
+    }
+
+    # Get ALL adapters and find subnets to relay into
+    $adapters = Get-NetworkAdapters
+    Write-Info "Found $($adapters.Count) active adapters for update relay"
+    
+    # Get relay networks - exclude the subnet where the update came from
+    $relayNets = Get-RelayNetworks -SenderIP ([string]$marker.origin_sender_ip) -Adapters $adapters
+    Write-Info "Relay networks found: $($relayNets.Count)"
+
+    # Also explicitly log each relay network
+    foreach ($net in $relayNets) {
+        Write-Info "  -> $($net.IPAddress)/$($net.Prefix) broadcast $($net.Broadcast)"
+    }
+
+    # Clean up marker/payload files
+    Remove-Item -Path $UPDATE_RELAY_MARKER  -Force -ErrorAction SilentlyContinue
+    Remove-Item -Path $UPDATE_RELAY_PAYLOAD -Force -ErrorAction SilentlyContinue
+
+    if (@($relayNets).Count -eq 0) {
+        Write-Info "Applied v$($marker.update_version) - no hotspotted subnets detected, nothing to daisy-chain"
+        return
+    }
+
+    Write-Info "Applied v$($marker.update_version) - daisy-chaining update into $(@($relayNets).Count) hotspotted subnet(s)"
+
+    $scriptBlock = {
+        param($RelayNets, $PayloadBytes, $Token, $UpdateVersion, $TransferId, $FileSize, $Sha256,
+              $UpdateMagic, $ProtoVersion, $TcpPortBase, $UpdatePort, $DurationSecs, $LogFile)
+
+        # ── All functions must be defined inside the scriptblock ──
+        
+        function Get-SubnetInfoLocal {
+            param([string]$IP, [int]$PrefixLength)
+            $ipBytes = ([System.Net.IPAddress]::Parse($IP)).GetAddressBytes()
+            [array]::Reverse($ipBytes)
+            $ipInt = [BitConverter]::ToUInt32($ipBytes, 0)
+            if ($PrefixLength -le 0) {
+                $mask = [uint32]0
+                $hostMask = [uint32]0xFFFFFFFF
+            } elseif ($PrefixLength -ge 32) {
+                $mask = [uint32]0xFFFFFFFF
+                $hostMask = [uint32]0
+            } else {
+                $hostBits = 32 - $PrefixLength
+                $hostMask = [uint32]([Math]::Pow(2, $hostBits) - 1)
+                $mask = [uint32]([Math]::Pow(2, 32) - [Math]::Pow(2, $hostBits))
+            }
+            $network = [uint32]($ipInt -band $mask)
+            $broadcast = [uint32]($network + $hostMask)
+            $bBytes = [BitConverter]::GetBytes($broadcast)
+            [array]::Reverse($bBytes)
+            $broadcastStr = ([System.Net.IPAddress]$bBytes).ToString()
+            return [pscustomobject]@{ 
+                Network = $network
+                Broadcast = $broadcast
+                BroadcastStr = $broadcastStr
+                Mask = $mask
+            }
+        }
+
+        function Get-ArpHostsInSubnetLocal {
+            param([string]$LocalIP, [int]$PrefixLength, [string]$ExcludeIP)
+            $hosts = @{}
+            try {
+                $si = Get-SubnetInfoLocal -IP $LocalIP -PrefixLength $PrefixLength
+                $arpOutput = arp -a 2>$null
+                foreach ($line in $arpOutput) {
+                    if ($line -match '(\d{1,3}(?:\.\d{1,3}){3})\s+([\da-fA-F]{2}(?:[:\-][\da-fA-F]{2}){5})\s+(dynamic|static)') {
+                        $arpIP  = $Matches[1]
+                        $arpMac = ($Matches[2].ToUpper() -replace '-', ':')
+                        if ($arpIP -eq $ExcludeIP) { continue }
+                        try {
+                            $aBytes = ([System.Net.IPAddress]::Parse($arpIP)).GetAddressBytes()
+                            [array]::Reverse($aBytes)
+                            $aInt = [BitConverter]::ToUInt32($aBytes, 0)
+                            if (($aInt -band $si.Mask) -eq $si.Network -and
+                                 $aInt -ne $si.Broadcast -and $aInt -ne $si.Network) {
+                                $hosts[$arpIP] = $arpMac
+                            }
+                        } catch {}
+                    }
+                }
+            } catch { 
+                Log-R "Get-ArpHostsInSubnetLocal error: $_" 
+            }
+            return $hosts
+        }
+
+        function Get-HmacSha256Local {
+            param([string]$Secret, [string]$Message)
+            $keyBytes  = [System.Text.Encoding]::UTF8.GetBytes($Secret)
+            $msgBytes  = [System.Text.Encoding]::UTF8.GetBytes($Message)
+            $hmac      = New-Object System.Security.Cryptography.HMACSHA256
+            $hmac.Key  = $keyBytes
+            $hashBytes = $hmac.ComputeHash($msgBytes)
+            return ($hashBytes | ForEach-Object { $_.ToString('x2') }) -join ''
+        }
+
+        # ── Logging ──
+        $logLock = New-Object System.Threading.Mutex($false, 'MnetiLogMutex')
+        function Log-R {
+            param([string]$m)
+            $line = "{0} [UPDATE-RELAY] {1}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $m
+            try { if ($logLock.WaitOne(500)) { Add-Content -Path $LogFile -Value $line -Encoding UTF8 -Force } }
+            catch {} finally { try { $logLock.ReleaseMutex() } catch {} }
+        }
+
+        # ── Main relay logic ──
+        foreach ($net in $RelayNets) {
+            $localIP = $net.IPAddress
+            $bcast   = $net.Broadcast
+            $prefix  = $net.Prefix
+            Log-R "Relaying update v$UpdateVersion into $localIP/$prefix -> broadcast $bcast"
+
+            # STEP 1: Ping sweep to seed ARP cache (same as discovery relay)
+            Log-R "Ping sweep (ARP seed) on $localIP/$prefix ..."
+            try {
+                $si = Get-SubnetInfoLocal -IP $localIP -PrefixLength $prefix
+                for ([uint32]$hostNum = $si.Network + 1; $hostNum -lt $si.Broadcast; $hostNum++) {
+                    $hBytes = [BitConverter]::GetBytes($hostNum)
+                    [array]::Reverse($hBytes)
+                    $targetIP = ([System.Net.IPAddress]$hBytes).ToString()
+                    if ($targetIP -eq $localIP) { continue }
+                    try {
+                        $ping = New-Object System.Net.NetworkInformation.Ping
+                        $ping.SendAsync($targetIP, 150, $null) | Out-Null
+                    } catch {}
+                }
+                Start-Sleep -Milliseconds 800
+            } catch { Log-R "Ping sweep failed on $localIP/$prefix : $_" }
+
+            # STEP 2: Read ARP to find hosts (after ping sweep)
+            $arpHosts = Get-ArpHostsInSubnetLocal -LocalIP $localIP -PrefixLength $prefix -ExcludeIP $localIP
+            Log-R "ARP scan found $(@($arpHosts.Keys).Count) host(s) on $localIP/$prefix"
+            
+            # Log each ARP entry found
+            foreach ($arpIP in $arpHosts.Keys) {
+                Log-R "  ARP entry: $arpIP -> $($arpHosts[$arpIP])"
+            }
+
+            # STEP 3: Build update announcement packet
+            $timestamp  = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+            $payloadObj = [ordered]@{
+                magic = $UpdateMagic
+                proto_version = $ProtoVersion
+                update_version = $UpdateVersion
+                tcp_port = $TcpPortBase
+                file_size = $FileSize
+                sha256 = $Sha256
+                timestamp = $timestamp
+                transfer_id = $TransferId
+                token = $Token
+            }
+            $canonical = '{"magic":"' + $payloadObj.magic + '","proto_version":' + $payloadObj.proto_version +
+                         ',"update_version":"' + $payloadObj.update_version + '","tcp_port":' + $payloadObj.tcp_port +
+                         ',"file_size":' + $payloadObj.file_size + ',"sha256":"' + $payloadObj.sha256 +
+                         '","timestamp":"' + $payloadObj.timestamp + '","transfer_id":"' + $payloadObj.transfer_id +
+                         '","token":"' + $payloadObj.token + '"}'
+            $sig      = Get-HmacSha256Local -Secret $Token -Message $canonical
+            $envelope = @{ payload = $payloadObj; sig = $sig }
+            $packetBytes = [System.Text.Encoding]::UTF8.GetBytes(($envelope | ConvertTo-Json -Compress -Depth 5))
+
+            # STEP 4: Send broadcast announcement
+            try {
+                $udp = New-Object System.Net.Sockets.UdpClient
+                $udp.EnableBroadcast = $true
+                $udp.Client.SetSocketOption([System.Net.Sockets.SocketOptionLevel]::Socket, 
+                    [System.Net.Sockets.SocketOptionName]::ReuseAddress, $true)
+                $sent = $udp.Send($packetBytes, $packetBytes.Length, $bcast, $UpdatePort)
+                $udp.Close()
+                Log-R "Update announcement BROADCAST to ${bcast}:$UpdatePort - $sent bytes sent (tcp_port=$TcpPortBase)"
+            } catch {
+                Log-R "Broadcast failed on $localIP : $_"
+                continue
+            }
+
+            # STEP 5: Unicast to each ARP-known host (AFTER ping sweep)
+            $unicastSent = 0
+            foreach ($arpIP in $arpHosts.Keys) {
+                try {
+                    $udpUnicast = New-Object System.Net.Sockets.UdpClient
+                    $udpUnicast.EnableBroadcast = $false
+                    $udpUnicast.Send($packetBytes, $packetBytes.Length, $arpIP, $UpdatePort) | Out-Null
+                    $udpUnicast.Close()
+                    $unicastSent++
+                    Log-R "Unicast update announcement sent to $arpIP (MAC $($arpHosts[$arpIP]))"
+                } catch { 
+                    Log-R "Unicast to $arpIP failed: $_" 
+                }
+            }
+            Log-R "Unicast update announcements sent to $unicastSent host(s) in subnet"
+
+            # STEP 6: Start TCP server for file transfer
+            $listener = $null
+            $port     = $null
+            for ($attempt = 0; $attempt -le 4; $attempt++) {
+                try {
+                    $port     = $TcpPortBase + $attempt
+                    $listener = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Parse($localIP), $port)
+                    $listener.Start()
+                    Log-R "TCP server started on ${localIP}:$port"
+                    break
+                } catch { 
+                    $listener = $null
+                    Log-R "TCP server attempt $attempt on port $port failed: $_"
+                }
+            }
+            if (-not $listener) {
+                Log-R "Could not open a relay TCP port on $localIP - skipping this subnet"
+                continue
+            }
+            try {
+                $ruleName = "Mneti Relay (TCP $port)"
+                if (-not (Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue)) {
+                    New-NetFirewallRule -DisplayName $ruleName -Direction Inbound -Protocol TCP `
+                        -LocalPort $port -Action Allow | Out-Null
+                    Log-R "Firewall rule added for TCP port $port"
+                }
+            } catch {}
+
+            # STEP 7: Serve the file to any clients that connect
+            $deadline = [DateTime]::Now.AddSeconds($DurationSecs)
+            $served   = 0
+            Log-R "TCP server listening for $DurationSecs seconds..."
+            
+            while ([DateTime]::Now -lt $deadline) {
+                try {
+                    if (-not $listener.Pending()) { 
+                        Start-Sleep -Milliseconds 250
+                        continue 
+                    }
+                    $client = $listener.AcceptTcpClient()
+                    try {
+                        $ns = $client.GetStream()
+                        $ns.Write($PayloadBytes, 0, $PayloadBytes.Length)
+                        $ns.Flush()
+                        $served++
+                        Log-R "Served update to $($client.Client.RemoteEndPoint)"
+                    } catch { 
+                        Log-R "Error serving relay client: $_" 
+                    }
+                    finally { 
+                        try { $client.Close() } catch {} 
+                    }
+                } catch { 
+                    Log-R "Accept error: $_" 
+                }
+            }
+            try { 
+                $listener.Stop() 
+                Log-R "TCP server stopped on ${localIP}:$port"
+            } catch {}
+            Log-R "Done serving $localIP (clients served: $served)"
+        }
+
+        Log-R "Daisy-chain update relay complete for v$UpdateVersion"
+    }
+
+    # Launch the background runspace
+    $ps = [powershell]::Create()
+    [void]$ps.AddScript($scriptBlock).AddArgument($relayNets).AddArgument($payloadBytes).
+        AddArgument($Config.token).AddArgument([string]$marker.update_version).AddArgument([string]$marker.transfer_id).
+        AddArgument([int64]$marker.file_size).AddArgument([string]$marker.sha256).
+        AddArgument($UPDATE_MAGIC).AddArgument($UPDATE_PROTO_MAX).AddArgument($UPDATE_RELAY_TCP_PORT).
+        AddArgument($UPDATE_UDP_PORT).AddArgument($UPDATE_RELAY_SERVE_SECS).AddArgument($LOG_FILE)
+    [void]$ps.BeginInvoke()
+    $null = $script:BackgroundRunspaces.Add($ps)
+}
+
 # ── Main packet handler ───────────────────────────────────────────────────────
 function Invoke-PacketHandler {
     param([byte[]]$Data, [string]$SenderIP, [object]$Config)
 
-    # ── FIX 7: Validate and dedup BEFORE any expensive work ──────────────────
-    # Parsing and HMAC validation first (cheap crypto, rejects forgeries)
+    # Validate and dedup
     $payload = Test-Packet -Bytes $Data -Token $Config.token
     if ($null -eq $payload) { return }
 
     $requestId   = $payload.request_id
     $callbackUrl = $payload.callback_url
     $mode        = $payload.mode
-
     if (-not $requestId -or -not $callbackUrl) {
         Write-Warn "Packet missing request_id or callback_url - dropped"; return
     }
-
-    # Dedup check immediately after validation — prevents multi-interface
-    # machines from processing the same broadcast more than once
     if (Test-AlreadySeen -RequestId $requestId) {
         Write-Debug2 "Duplicate request_id $requestId - ignored"; return
     }
 
     Write-Info "Received packet with callback_url: $callbackUrl"
 
-    # ── FIX 12: ip_history mode short-circuits everything else ───────────────
-    # Answered purely from the local log file — no ARP scan, no relay, no
-    # live adapter check beyond what's already in the log.
+    # ip_history mode
     if ($mode -eq 'ip_history') {
         Write-Info "IP history query received: qmode=$($payload.iph_mode) id=$requestId from=$SenderIP"
         $matches = Get-IpHistoryMatches -QueryMode $payload.iph_mode -StartUtc $payload.iph_start `
@@ -1305,24 +1629,20 @@ function Invoke-PacketHandler {
                 switch_name     = [string]$Config.switch_name
                 router_name     = [string]$Config.router_name
             }
-            Send-Report -CallbackUrl $callbackUrl -Report $report -Token $Config.token -SourceIP $reportingAdapter.IP -SourceIP $reportingAdapter.IP
+            # ip_history replies also need source binding (use the same adapter logic)
+            $adapter = Get-AdapterForSender -Adapters (Get-NetworkAdapters) -SenderIP $SenderIP
+            $srcIP = if ($adapter) { $adapter.IP } else { $null }
+            Send-Report -CallbackUrl $callbackUrl -Report $report -Token $Config.token -SourceIP $srcIP
         }
         Write-Info "IP history query answered: $(@($matches).Count) match(es)"
         return
     }
 
-    # Now do the expensive adapter enumeration (only once per unique request)
+    # Normal discovery
     $target     = $payload.target
     $relayDepth = [int]$payload.relay_depth
-    $isPrimary  = if ($null -ne $payload.is_primary) { [bool]$payload.is_primary } else { $false }
-
-    $adapters = Get-NetworkAdapters
-    $myIPs    = @($adapters | ForEach-Object { $_.IP })
-
-    #if ($myIPs -contains $SenderIP) {
-    #    Write-Debug2 "Dropping self-originated packet from $SenderIP (id=$requestId)"
-    #    return
-    #}
+    $adapters   = Get-NetworkAdapters
+    $myIPs      = @($adapters | ForEach-Object { $_.IP })
 
     Write-Info "Discovery request: mode=$mode depth=$relayDepth id=$requestId from=$SenderIP"
 
@@ -1348,7 +1668,6 @@ function Invoke-PacketHandler {
         if ($Config.additional_ports) {
             $additionalPorts = @($Config.additional_ports | ForEach-Object { [string]$_ })
         }
-
         $switchName = if ($Config.switch_name) { [string]$Config.switch_name } else { '' }
         $routerName = if ($Config.router_name) { [string]$Config.router_name } else { '' }
 
@@ -1374,7 +1693,8 @@ function Invoke-PacketHandler {
             router_name      = $routerName
         }
 
-        Send-Report -CallbackUrl $callbackUrl -Report $report -Token $Config.token
+        # FIX: bind to the reporting adapter's IP
+        Send-Report -CallbackUrl $callbackUrl -Report $report -Token $Config.token -SourceIP $reportingAdapter.IP
     }
 
     if ($relayDepth -ge $MAX_RELAY_DEPTH) {
@@ -1404,6 +1724,13 @@ function Start-AgentListener {
     Write-Info "Mneti Agent starting - UDP listener on port $UDP_PORT"
     Write-Info "Version: $AGENT_VERSION | Building: $($config.building) | Room: $($config.room)"
     Write-Info "Token length: $($config.token.Length) chars"
+
+    # ── FIX 14: daisy-chain a just-applied update to hotspotted devices ───────
+    # No-op unless the updater helper staged a relay marker (i.e. this
+    # process is the FIRST startup after successfully applying an update it
+    # received from upstream). Runs in the background - does not block the
+    # UDP socket bind below.
+    Invoke-PendingUpdateRelay -Config $config
 
     # ── FIX 11: seed the IP-history baseline ──────────────────────────────────
     # Record current IP(s) once at startup, both as the comparison baseline
