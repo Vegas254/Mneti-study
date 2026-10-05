@@ -1,137 +1,193 @@
 """
-Mneti - Server-side ARP/ping sweep for unmanaged device discovery.
-
-Runs ONLY on the server. Replaces the per-agent ARP scan that used to run
-inside Invoke-SubnetRelay on relay-capable agents. Centralising this here:
-
-  - Avoids needing every relay-capable agent to have a second NIC into
-    each subnet just to ARP-scan it.
-  - Produces one ping sweep + ARP read per subnet per discovery run,
-    instead of N agents each doing their own sweep.
-  - Lets the dashboard's custom broadcast ranges (e.g. 10.51.144.0/22)
-    double as the scan ranges for unmanaged-device discovery.
-
-Devices found here are reported with type="unmanaged". If a managed or
-relayed report for the same MAC arrives (from the agent itself), the
-result_store upgrade logic replaces the unmanaged entry — so a device
-never shows up twice.
+Mneti Background ARP Scanner & Conflict Detector
+Uses Scapy for active ARP sweeps and passive ARP packet sniffing.
+Detects unmanaged network assets and flags immediate IP-MAC collisions.
 """
 
-import subprocess
-import re
-import ipaddress
+import os
+import sys
+import time
 import logging
-import platform
-import concurrent.futures
+import threading
+import ipaddress
+import psutil
 
-log = logging.getLogger("mneti.arpscan")
+# Add server directory to path
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from database import record_ip_observation
 
-_ARP_LINE_RE_WIN = re.compile(
-    r'(?P<ip>\d{1,3}(?:\.\d{1,3}){3})\s+'
-    r'(?P<mac>[\da-fA-F]{2}(?:[:\-][\da-fA-F]{2}){5})\s+dynamic',
-    re.IGNORECASE,
-)
+log = logging.getLogger("mneti.arp_scanner")
+
+# Embedded High-Frequency OUI Vendor Mapping for Healthcare & Enterprise Network Environments
+OUI_TABLE = {
+    "00:14:22": "Dell Inc.",
+    "00:1A:2B": "HP Inc.",
+    "18:66:DA": "Dell Inc.",
+    "00:1B:78": "Siemens Healthineers",
+    "00:07:4D": "Zebra Technologies",
+    "00:09:0F": "Sysmex Corporation",
+    "00:03:7F": "Philips Healthcare",
+    "00:50:56": "VMware Virtual Platform",
+    "00:0C:29": "VMware Virtual Platform",
+    "00:80:A3": "Roche Diagnostics",
+    "AC:CC:8E": "Hikvision Digital",
+    "3C:D9:2B": "Barco Healthcare",
+    "B4:B5:2F": "Mindray Medical",
+    "A4:BB:6D": "Apple Inc.",
+    "00:23:7D": "HP Inc.",
+    "00:00:0C": "Cisco Systems",
+    "00:01:42": "Cisco Systems",
+    "54:EE:75": "HP Enterprise",
+    "00:1E:67": "Lenovo ThinkCentre",
+    "B8:27:EB": "Raspberry Pi Foundation",
+    "DC:A6:32": "Raspberry Pi Foundation",
+    "E4:5F:01": "Raspberry Pi Foundation",
+    "00:DE:AD": "Rogue Injector / Test Device"
+}
 
 
-def _ping(ip: str, timeout_ms: int = 200):
-    """Fire a single ICMP ping to populate the ARP/neighbour cache.
-    The result is ignored — we only care about the side effect on the
-    ARP table.
+def lookup_vendor(mac: str) -> str:
+    """Resolve IEEE OUI prefix to hardware manufacturer."""
+    if not mac:
+        return "Unknown"
+    norm_mac = mac.replace("-", ":").upper().strip()
+    prefix = norm_mac[:8]
+    return OUI_TABLE.get(prefix, "Standard Network Device")
+
+
+def get_local_subnets() -> list[ipaddress.IPv4Network]:
+    """Identify usable IPv4 networks across active physical interfaces."""
+    networks = []
+    for iface, addrs in psutil.net_if_addrs().items():
+        if iface.startswith("lo"):
+            continue
+        for addr in addrs:
+            if addr.family == psutil.AF_LINK or addr.family == 2: # AF_INET
+                if hasattr(addr, 'netmask') and addr.netmask and addr.address:
+                    try:
+                        net = ipaddress.IPv4Network(f"{addr.address}/{addr.netmask}", strict=False)
+                        if not net.is_loopback and net.num_addresses <= 1024:
+                            networks.append(net)
+                    except Exception:
+                        pass
+    return networks
+
+
+class ScapyARPScanner(threading.Thread):
     """
-    system = platform.system().lower()
-    if system == "windows":
-        cmd = ["ping", "-n", "1", "-w", str(timeout_ms), ip]
-    else:
-        timeout_s = max(1, round(timeout_ms / 1000))
-        cmd = ["ping", "-c", "1", "-W", str(timeout_s), ip]
-    try:
-        subprocess.run(cmd, capture_output=True, timeout=2)
-    except Exception:
-        pass
+    Continuous background daemon that:
+      1. Passively sniffs ARP replies and requests (fast collision detection).
+      2. Actively sweeps local subnets using Scapy ARP probes.
+      3. Gracefully reads system ARP cache if raw packet capture lacks root privileges.
+    """
 
+    def __init__(self, sweep_interval: int = 15, on_conflict_callback = None):
+        super().__init__(daemon=True)
+        self.sweep_interval = sweep_interval
+        self.on_conflict_callback = on_conflict_callback
+        self.running = True
+        self.scapy_available = False
 
-def _read_arp_table() -> dict[str, str]:
-    """Return {ip: mac} from the OS ARP/neighbour cache."""
-    result: dict[str, str] = {}
-    system = platform.system().lower()
+        try:
+            import scapy.all as scapy_mod
+            self.scapy = scapy_mod
+            self.scapy_available = True
+        except ImportError:
+            log.warning("Scapy is not installed. ARP scanner will operate in cache-read mode.")
 
-    try:
-        if system == "windows":
-            out = subprocess.run(
-                ["arp", "-a"], capture_output=True, text=True, timeout=10
-            ).stdout
-            for line in out.splitlines():
-                m = _ARP_LINE_RE_WIN.search(line)
-                if m:
-                    result[m.group("ip")] = m.group("mac").upper().replace("-", ":")
+    def run(self):
+        log.info("Starting Mneti Background ARP Scanner & Conflict Daemon...")
+
+        # If Scapy and root privileges are available, start passive sniffer in subthread
+        if self.scapy_available and os.geteuid() == 0:
+            sniffer_thread = threading.Thread(target=self._passive_arp_sniff, daemon=True)
+            sniffer_thread.start()
+            log.info("Passive raw ARP sniffer launched (Kernel Filter: 'arp')")
         else:
-            # Prefer `ip neigh` (modern Linux), fall back to /proc/net/arp
+            log.info("Raw packet sniffing requires root (sudo). Active sweeps & kernel table polling enabled.")
+
+        while self.running:
             try:
-                out = subprocess.run(
-                    ["ip", "neigh"], capture_output=True, text=True, timeout=10
-                ).stdout
-                for line in out.splitlines():
-                    parts = line.split()
-                    if len(parts) >= 5 and "lladdr" in parts:
-                        ip = parts[0]
-                        mac = parts[parts.index("lladdr") + 1].upper()
-                        if re.match(r'^[0-9A-F:]{17}$', mac):
-                            result[ip] = mac
-            except Exception:
-                pass
+                self.perform_sweep()
+            except Exception as e:
+                log.error("ARP sweep exception: %s", e)
+            time.sleep(self.sweep_interval)
 
-            if not result:
+    def _process_arp_pair(self, ip: str, mac: str, source_tag: str = "arp-sweep"):
+        """Evaluates an (IP, MAC) pair against the database to detect collisions."""
+        if not ip or not mac or ip.startswith("127.") or ip == "0.0.0.0":
+            return
+
+        vendor = lookup_vendor(mac)
+        res = record_ip_observation(
+            ip=ip,
+            mac=mac,
+            vendor=vendor,
+            device_type="unmanaged"
+        )
+
+        if res.get("conflict"):
+            log.critical(
+                "🚨 [CRITICAL ALERT - %s] IP Conflict Detected on %s! Registered MAC: %s vs Colliding MAC: %s",
+                source_tag.upper(), ip, res["registered_mac"], res["colliding_mac"]
+            )
+            if self.on_conflict_callback:
                 try:
-                    with open("/proc/net/arp", encoding="utf-8") as f:
-                        next(f)  # skip header
-                        for line in f:
-                            parts = line.split()
-                            if len(parts) >= 4:
-                                ip, mac = parts[0], parts[3].upper()
-                                if mac != "00:00:00:00:00:00" and re.match(
-                                    r'^[0-9A-F:]{17}$', mac
-                                ):
-                                    result[ip] = mac
+                    self.on_conflict_callback(res)
+                except Exception as cb_err:
+                    log.error("Conflict callback error: %s", cb_err)
+
+    def _passive_arp_sniff(self):
+        """Sniffs live ARP frames in real-time to catch instant IP clashes."""
+        def handle_pkt(pkt):
+            if pkt.haslayer(self.scapy.ARP):
+                arp = pkt[self.scapy.ARP]
+                # arp.psrc is sender IP, arp.hwsrc is sender MAC
+                self._process_arp_pair(arp.psrc, arp.hwsrc, source_tag="passive-sniff")
+
+        try:
+            self.scapy.sniff(filter="arp", prn=handle_pkt, store=False)
+        except Exception as e:
+            log.warning("Passive ARP sniff stopped: %s", e)
+
+    def perform_sweep(self):
+        """Sweeps networks using Scapy ARP probes, falling back to /proc/net/arp."""
+        swept_devices = {}
+
+        # Mode A: Scapy Active ARP Ping (if root or socket allowed)
+        if self.scapy_available and os.geteuid() == 0:
+            subnets = get_local_subnets()
+            for net in subnets:
+                try:
+                    ans, _ = self.scapy.srp(
+                        self.scapy.Ether(dst="ff:ff:ff:ff:ff:ff") / self.scapy.ARP(pdst=str(net)),
+                        timeout=1.5,
+                        verbose=False
+                    )
+                    for _, rcv in ans:
+                        swept_devices[rcv.psrc] = rcv.hwsrc
                 except Exception as e:
-                    log.warning("Failed to read /proc/net/arp: %s", e)
-    except Exception as e:
-        log.warning("ARP table read failed: %s", e)
+                    log.debug("Scapy srp sweep failed on %s: %s", net, e)
 
-    return result
+        # Mode B: System /proc/net/arp Table Polling (works reliably across all environments)
+        if os.path.exists("/proc/net/arp"):
+            try:
+                with open("/proc/net/arp", "r") as f:
+                    lines = f.readlines()[1:] # skip header
+                    for line in lines:
+                        parts = line.split()
+                        if len(parts) >= 4:
+                            ip = parts[0]
+                            mac = parts[3].upper()
+                            flags = parts[2]
+                            if mac != "00:00:00:00:00:00" and flags != "0x0":
+                                swept_devices[ip] = mac
+            except Exception as e:
+                log.debug("Error reading /proc/net/arp: %s", e)
 
+        # Process all observed pairs
+        for ip, mac in swept_devices.items():
+            self._process_arp_pair(ip, mac, source_tag="active-sweep")
 
-def scan_subnet(
-    network: ipaddress.IPv4Network,
-    exclude_ips: set[str] | None = None,
-    max_workers: int = 32,
-) -> dict[str, str]:
-    """
-    Ping-sweep every host in `network` in parallel to populate the ARP
-    cache, then read it back.
-
-    Returns {ip: mac} for hosts that responded / appeared in the ARP
-    table within this network.
-    """
-    exclude_ips = exclude_ips or set()
-
-    try:
-        hosts = [str(h) for h in network.hosts() if str(h) not in exclude_ips]
-    except Exception as e:
-        log.warning("scan_subnet: cannot enumerate hosts for %s: %s", network, e)
-        return {}
-
-    if not hosts:
-        return {}
-
-    log.info("ARP scan: sweeping %d host(s) in %s", len(hosts), network)
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
-        list(ex.map(_ping, hosts))
-
-    arp_table = _read_arp_table()
-    host_set = set(hosts)
-
-    found = {ip: mac for ip, mac in arp_table.items() if ip in host_set}
-
-    log.info("ARP scan: %d device(s) responded in %s", len(found), network)
-    return found
+    def stop(self):
+        self.running = False

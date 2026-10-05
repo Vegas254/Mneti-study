@@ -1,0 +1,765 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Mneti | NCRTH Network Asset Discovery & Topology</title>
+    <!-- Vis.js CDN (Ultra-lightweight Vanilla Network Graph) -->
+    <script type="text/javascript" src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
+    <style>
+        :root {
+            --bg-dark: #0b1120;
+            --card-bg: #111827;
+            --card-border: #1f2937;
+            --accent-cyan: #06b6d4;
+            --accent-blue: #3b82f6;
+            --green: #10b981;
+            --yellow: #f59e0b;
+            --red: #ef4444;
+            --text-main: #f3f4f6;
+            --text-muted: #9ca3af;
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            background-color: var(--bg-dark);
+            color: var(--text-main);
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            overflow-x: hidden;
+        }
+
+        /* Top Header */
+        header {
+            background-color: rgba(17, 24, 39, 0.85);
+            backdrop-filter: blur(12px);
+            border-bottom: 1px solid var(--card-border);
+            padding: 12px 24px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            position: sticky;
+            top: 0;
+            z-index: 100;
+        }
+
+        .brand {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .brand-logo {
+            width: 38px;
+            height: 38px;
+            background: linear-gradient(135deg, #0ea5e9, #0284c7);
+            border-radius: 8px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 20px;
+            font-weight: 800;
+            color: #fff;
+            box-shadow: 0 0 15px rgba(14, 165, 233, 0.4);
+        }
+
+        .brand-text h1 {
+            font-size: 1.15rem;
+            font-weight: 700;
+            letter-spacing: -0.02em;
+            color: #ffffff;
+        }
+
+        .brand-text p {
+            font-size: 0.75rem;
+            color: var(--accent-cyan);
+            font-weight: 500;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }
+
+        .header-actions {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .btn {
+            background: #1f2937;
+            border: 1px solid #374151;
+            color: #e5e7eb;
+            padding: 7px 14px;
+            border-radius: 6px;
+            font-size: 0.82rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        .btn:hover {
+            background: #374151;
+            border-color: #4b5563;
+        }
+
+        .btn-primary {
+            background: #0284c7;
+            border-color: #0369a1;
+            color: #ffffff;
+        }
+
+        .btn-primary:hover {
+            background: #0369a1;
+        }
+
+        .btn-danger {
+            background: #991b1b;
+            border-color: #dc2626;
+            color: #fee2e2;
+        }
+
+        .btn-danger:hover {
+            background: #dc2626;
+        }
+
+        /* Alert Banner */
+        #alert-banner {
+            padding: 10px 24px;
+            font-size: 0.875rem;
+            font-weight: 600;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            transition: all 0.3s ease;
+        }
+
+        .banner-normal {
+            background: rgba(16, 185, 129, 0.12);
+            color: #34d399;
+            border-bottom: 1px solid rgba(16, 185, 129, 0.3);
+        }
+
+        .banner-conflict {
+            background: rgba(239, 68, 68, 0.25);
+            color: #fca5a5;
+            border-bottom: 2px solid #ef4444;
+            animation: pulse-red 1.5s infinite;
+        }
+
+        @keyframes pulse-red {
+            0% { background: rgba(239, 68, 68, 0.20); }
+            50% { background: rgba(239, 68, 68, 0.40); }
+            100% { background: rgba(239, 68, 68, 0.20); }
+        }
+
+        /* Metric Stats Bar */
+        .metrics-bar {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+            gap: 12px;
+            padding: 16px 24px;
+        }
+
+        .metric-card {
+            background: var(--card-bg);
+            border: 1px solid var(--card-border);
+            border-radius: 8px;
+            padding: 12px 16px;
+            display: flex;
+            flex-direction: column;
+        }
+
+        .metric-title {
+            font-size: 0.75rem;
+            color: var(--text-muted);
+            text-transform: uppercase;
+            font-weight: 600;
+        }
+
+        .metric-value {
+            font-size: 1.5rem;
+            font-weight: 700;
+            margin-top: 4px;
+            color: #f9fafb;
+        }
+
+        /* Main Workspace Container */
+        .main-container {
+            display: flex;
+            flex-direction: column;
+            gap: 16px;
+            padding: 0 24px 24px;
+            flex: 1;
+        }
+
+        /* Topology Canvas Card */
+        .topology-card {
+            background: var(--card-bg);
+            border: 1px solid var(--card-border);
+            border-radius: 10px;
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.4);
+        }
+
+        .card-header {
+            padding: 12px 18px;
+            border-bottom: 1px solid var(--card-border);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .card-header h2 {
+            font-size: 0.95rem;
+            font-weight: 600;
+            color: #e5e7eb;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .legend {
+            display: flex;
+            gap: 16px;
+            font-size: 0.78rem;
+        }
+
+        .legend-item {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        .legend-dot {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+        }
+
+        #network-canvas {
+            height: 480px;
+            background: #090e17;
+            position: relative;
+        }
+
+        /* Table Card */
+        .table-card {
+            background: var(--card-bg);
+            border: 1px solid var(--card-border);
+            border-radius: 10px;
+            overflow: hidden;
+        }
+
+        .table-controls {
+            padding: 12px 18px;
+            border-bottom: 1px solid var(--card-border);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .search-input {
+            background: #1f2937;
+            border: 1px solid #374151;
+            padding: 6px 12px;
+            border-radius: 6px;
+            color: #fff;
+            font-size: 0.85rem;
+            width: 280px;
+        }
+
+        .search-input:focus {
+            outline: none;
+            border-color: var(--accent-cyan);
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 0.84rem;
+            text-align: left;
+        }
+
+        th {
+            background: #131d2e;
+            color: #94a3b8;
+            font-weight: 600;
+            padding: 10px 16px;
+            border-bottom: 1px solid var(--card-border);
+            text-transform: uppercase;
+            font-size: 0.72rem;
+            letter-spacing: 0.04em;
+        }
+
+        td {
+            padding: 10px 16px;
+            border-bottom: 1px solid #1f2937;
+            color: #e2e8f0;
+        }
+
+        tr:hover td {
+            background: rgba(255, 255, 255, 0.02);
+        }
+
+        .status-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 5px;
+            padding: 2px 8px;
+            border-radius: 12px;
+            font-size: 0.75rem;
+            font-weight: 600;
+        }
+
+        .badge-online {
+            background: rgba(16, 185, 129, 0.15);
+            color: #34d399;
+            border: 1px solid rgba(16, 185, 129, 0.3);
+        }
+
+        .badge-unmanaged {
+            background: rgba(245, 158, 11, 0.15);
+            color: #fbbf24;
+            border: 1px solid rgba(245, 158, 11, 0.3);
+        }
+
+        .badge-conflict {
+            background: rgba(239, 68, 68, 0.25);
+            color: #f87171;
+            border: 1px solid #ef4444;
+            animation: pulse-red 1.2s infinite;
+        }
+
+        .font-mono {
+            font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+            font-size: 0.8rem;
+        }
+
+        /* Modal Drawer */
+        #device-modal {
+            display: none;
+            position: fixed;
+            top: 0;
+            right: 0;
+            bottom: 0;
+            width: 380px;
+            background: #111827;
+            border-left: 1px solid #374151;
+            box-shadow: -4px 0 25px rgba(0, 0, 0, 0.6);
+            z-index: 200;
+            padding: 24px;
+            flex-direction: column;
+            overflow-y: auto;
+        }
+
+        .modal-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-bottom: 1px solid #1f2937;
+            padding-bottom: 12px;
+            margin-bottom: 16px;
+        }
+
+        .modal-field {
+            margin-bottom: 14px;
+        }
+
+        .modal-label {
+            font-size: 0.72rem;
+            color: #9ca3af;
+            text-transform: uppercase;
+            font-weight: 600;
+        }
+
+        .modal-val {
+            font-size: 0.9rem;
+            color: #f3f4f6;
+            margin-top: 3px;
+        }
+    </style>
+</head>
+<body>
+
+    <!-- Header Navigation -->
+    <header>
+        <div class="brand">
+            <div class="brand-logo">M</div>
+            <div class="brand-text">
+                <h1>Mneti Network Topology & Asset Guardian</h1>
+                <p>Nakuru County Referral & Teaching Hospital (NCRTH)</p>
+            </div>
+        </div>
+
+        <div class="header-actions">
+            <button class="btn btn-primary" onclick="triggerDiscovery()">
+                <span id="scan-icon">⚡</span> Trigger Active Sweep
+            </button>
+            <button class="btn btn-danger" onclick="simulateConflict()">
+                ⚠️ Simulate IP Collision
+            </button>
+            <button class="btn" onclick="resolveAllConflicts()">
+                🛡️ Clear Conflicts
+            </button>
+        </div>
+    </header>
+
+    <!-- Top Alert Banner -->
+    <div id="alert-banner" class="banner-normal">
+        <span id="banner-text">🟢 System Operational — All 23 Endpoints Verified across 5 Clinical Subnets</span>
+        <button id="banner-btn" class="btn btn-danger" style="display: none; padding: 4px 10px; font-size: 0.75rem;" onclick="resolveAllConflicts()">Resolve Collision</button>
+    </div>
+
+    <!-- Metrics Bar -->
+    <div class="metrics-bar">
+        <div class="metric-card">
+            <div class="metric-title">Monitored Assets</div>
+            <div class="metric-value" id="stat-total">23</div>
+        </div>
+        <div class="metric-card">
+            <div class="metric-title">Managed Endpoints</div>
+            <div class="metric-value" style="color: #34d399;" id="stat-managed">14</div>
+        </div>
+        <div class="metric-card">
+            <div class="metric-title">Unmanaged Devices</div>
+            <div class="metric-value" style="color: #fbbf24;" id="stat-unmanaged">9</div>
+        </div>
+        <div class="metric-card">
+            <div class="metric-title">Subnets Monitored</div>
+            <div class="metric-value" style="color: #38bdf8;" id="stat-subnets">5 Subnets</div>
+        </div>
+        <div class="metric-card">
+            <div class="metric-title">Security Status</div>
+            <div class="metric-value" id="stat-security" style="color: #34d399; font-size: 1.15rem;">Zero Conflicts</div>
+        </div>
+    </div>
+
+    <!-- Main Workspace -->
+    <div class="main-container">
+        
+        <!-- Interactive Vis.js Topology Graph -->
+        <div class="topology-card">
+            <div class="card-header">
+                <h2>🌐 Physical & Logical Network Hierarchy</h2>
+                <div class="legend">
+                    <div class="legend-item"><div class="legend-dot" style="background: #38bdf8;"></div> Core/Switch</div>
+                    <div class="legend-item"><div class="legend-dot" style="background: #10b981;"></div> Managed Agent</div>
+                    <div class="legend-item"><div class="legend-dot" style="background: #f59e0b;"></div> Unmanaged Device</div>
+                    <div class="legend-item"><div class="legend-dot" style="background: #ef4444;"></div> IP Conflict</div>
+                </div>
+            </div>
+            <div id="network-canvas"></div>
+        </div>
+
+        <!-- Inventory Table -->
+        <div class="table-card">
+            <div class="table-controls">
+                <input type="text" id="search-box" class="search-input" placeholder="Filter by hostname, IP, MAC, room..." onkeyup="filterTable()">
+                <div style="font-size: 0.8rem; color: #94a3b8;" id="table-count">Showing 23 devices</div>
+            </div>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Status</th>
+                        <th>Hostname</th>
+                        <th>IP Address</th>
+                        <th>MAC Address</th>
+                        <th>Department / Subnet</th>
+                        <th>Physical Location</th>
+                        <th>Device Type</th>
+                        <th>Vendor / Details</th>
+                        <th>Last Seen</th>
+                    </tr>
+                </thead>
+                <tbody id="device-table-body">
+                    <!-- Populated dynamically via JS -->
+                </tbody>
+            </table>
+        </div>
+
+    </div>
+
+    <!-- Node Detail Drawer -->
+    <div id="device-modal">
+        <div class="modal-header">
+            <h3 style="font-size: 1rem; color: #fff;">Device Telemetry</h3>
+            <button class="btn" style="padding: 2px 8px;" onclick="closeModal()">✕</button>
+        </div>
+        <div id="modal-content"></div>
+    </div>
+
+    <script>
+        let network = null;
+        let nodesDataset = new vis.DataSet([]);
+        let edgesDataset = new vis.DataSet([]);
+        let allDevices = [];
+
+        // Initialize Vis.js
+        function initNetwork() {
+            const container = document.getElementById('network-canvas');
+            const data = { nodes: nodesDataset, edges: edgesDataset };
+            const options = {
+                layout: {
+                    hierarchical: {
+                        enabled: true,
+                        direction: 'UD',
+                        sortMethod: 'directed',
+                        nodeSpacing: 160,
+                        levelSeparation: 120
+                    }
+                },
+                physics: {
+                    hierarchicalRepulsion: {
+                        nodeDistance: 130
+                    }
+                },
+                interaction: {
+                    hover: true,
+                    tooltipDelay: 200,
+                    zoomView: true
+                }
+            };
+
+            network = new vis.Network(container, data, options);
+
+            network.on("click", function(params) {
+                if (params.nodes.length > 0) {
+                    const nodeId = params.nodes[0];
+                    const node = nodesDataset.get(nodeId);
+                    if (node && node.raw_device) {
+                        showModal(node.raw_device);
+                    }
+                }
+            });
+        }
+
+        // Fetch Live Topology & Metrics
+        async function fetchTopology() {
+            try {
+                const res = await fetch('/api/topology');
+                const data = await res.json();
+
+                // Update Metrics
+                document.getElementById('stat-total').innerText = data.device_count || 0;
+                document.getElementById('stat-managed').innerText = data.managed_count || 0;
+                document.getElementById('stat-unmanaged').innerText = data.unmanaged_count || 0;
+
+                // Update Banner & Security Alert
+                const banner = document.getElementById('alert-banner');
+                const bannerText = document.getElementById('banner-text');
+                const bannerBtn = document.getElementById('banner-btn');
+                const statSec = document.getElementById('stat-security');
+
+                if (data.has_conflict) {
+                    const c = data.conflicts[0];
+                    banner.className = 'banner-conflict';
+                    bannerText.innerHTML = `🚨 <strong>CRITICAL IP COLLISION DETECTED:</strong> IP <code>${c.ip}</code> claimed by rogue MAC address on ${c.hostname} (${c.building} - ${c.room})!`;
+                    bannerBtn.style.display = 'block';
+                    statSec.innerText = 'COLLISION DETECTED';
+                    statSec.style.color = '#ef4444';
+                } else {
+                    banner.className = 'banner-normal';
+                    bannerText.innerHTML = `🟢 <strong>System Operational:</strong> All ${data.device_count} endpoints verified across hospital clinical subnets. Zero collisions.`;
+                    bannerBtn.style.display = 'none';
+                    statSec.innerText = 'Zero Conflicts';
+                    statSec.style.color = '#34d399';
+                }
+
+                // Update Vis.js Dataset efficiently
+                nodesDataset.clear();
+                edgesDataset.clear();
+                nodesDataset.add(data.nodes);
+                edgesDataset.add(data.edges);
+
+            } catch (err) {
+                console.error("Topology fetch failed:", err);
+            }
+        }
+
+        // Fetch Full Device List for Inventory Table
+        async function fetchDevices() {
+            try {
+                const res = await fetch('/api/devices');
+                const data = await res.json();
+                allDevices = data.devices || [];
+                renderTable(allDevices);
+            } catch (err) {
+                console.error("Device list fetch failed:", err);
+            }
+        }
+
+        // Render Inventory Table
+        function renderTable(devices) {
+            const tbody = document.getElementById('device-table-body');
+            tbody.innerHTML = '';
+
+            devices.forEach(d => {
+                const isConflict = d.status === 'conflict';
+                let badgeClass = 'badge-online';
+                let badgeText = 'Managed Online';
+
+                if (isConflict) {
+                    badgeClass = 'badge-conflict';
+                    badgeText = '⚠️ IP CONFLICT';
+                } else if (d.device_type === 'unmanaged') {
+                    badgeClass = 'badge-unmanaged';
+                    badgeText = 'Unmanaged';
+                }
+
+                const tr = document.createElement('tr');
+                tr.innerHTML = `
+                    <td><span class="status-badge ${badgeClass}">${badgeText}</span></td>
+                    <td style="font-weight: 600;">${d.hostname}</td>
+                    <td class="font-mono">${d.ip}</td>
+                    <td class="font-mono" style="color: #94a3b8;">${d.mac}</td>
+                    <td><span style="color: #38bdf8;">${d.subnet || '10.100.x.0'}</span></td>
+                    <td>${d.building} &middot; <span style="color: #9ca3af;">${d.room}</span></td>
+                    <td>${d.device_type.toUpperCase()}</td>
+                    <td>${d.vendor || 'N/A'}</td>
+                    <td style="color: #94a3b8; font-size: 0.78rem;">${d.last_seen}</td>
+                `;
+                tbody.appendChild(tr);
+            });
+
+            document.getElementById('table-count').innerText = `Showing ${devices.length} devices`;
+        }
+
+        // Filter Table on Search
+        function filterTable() {
+            const query = document.getElementById('search-box').value.toLowerCase();
+            const filtered = allDevices.filter(d => 
+                d.hostname.toLowerCase().includes(query) ||
+                d.ip.toLowerCase().includes(query) ||
+                d.mac.toLowerCase().includes(query) ||
+                d.building.toLowerCase().includes(query) ||
+                d.room.toLowerCase().includes(query) ||
+                d.status.toLowerCase().includes(query)
+            );
+            renderTable(filtered);
+        }
+
+        // Modal Drawer Detail View
+        function showModal(dev) {
+            const modal = document.getElementById('device-modal');
+            const content = document.getElementById('modal-content');
+            modal.style.display = 'flex';
+
+            content.innerHTML = `
+                <div class="modal-field">
+                    <div class="modal-label">Hostname</div>
+                    <div class="modal-val" style="font-weight: 700; color: #38bdf8;">${dev.hostname}</div>
+                </div>
+                <div class="modal-field">
+                    <div class="modal-label">Status</div>
+                    <div class="modal-val"><span class="status-badge ${dev.status === 'conflict' ? 'badge-conflict' : 'badge-online'}">${dev.status.toUpperCase()}</span></div>
+                </div>
+                <div class="modal-field">
+                    <div class="modal-label">IP Address</div>
+                    <div class="modal-val font-mono">${dev.ip}</div>
+                </div>
+                <div class="modal-field">
+                    <div class="modal-label">MAC Address</div>
+                    <div class="modal-val font-mono">${dev.mac}</div>
+                </div>
+                <div class="modal-field">
+                    <div class="modal-label">Department / Subnet</div>
+                    <div class="modal-val">${dev.subnet}</div>
+                </div>
+                <div class="modal-field">
+                    <div class="modal-label">Physical Location</div>
+                    <div class="modal-val">${dev.building} &mdash; ${dev.room}</div>
+                </div>
+                <div class="modal-field">
+                    <div class="modal-label">Hardware Vendor</div>
+                    <div class="modal-val">${dev.vendor || 'Unknown'}</div>
+                </div>
+                <div class="modal-field">
+                    <div class="modal-label">Authenticated User</div>
+                    <div class="modal-val">${dev.logged_in_user || 'None (System)'}</div>
+                </div>
+                <div class="modal-field">
+                    <div class="modal-label">Telemetry Last Seen</div>
+                    <div class="modal-val" style="font-size: 0.8rem; color: #94a3b8;">${dev.last_seen}</div>
+                </div>
+            `;
+        }
+
+        function closeModal() {
+            document.getElementById('device-modal').style.display = 'none';
+        }
+
+        // Trigger Active Discovery
+        async function triggerDiscovery() {
+            const icon = document.getElementById('scan-icon');
+            icon.innerText = '⏳';
+            try {
+                await fetch('/api/scan', { method: 'POST' });
+                setTimeout(refreshAll, 1000);
+            } catch (e) {
+                alert('Scan trigger failed');
+            } finally {
+                setTimeout(() => icon.innerText = '⚡', 1500);
+            }
+        }
+
+        // Simulate IP Collision
+        async function simulateConflict() {
+            try {
+                await fetch('/api/simulate-conflict', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({
+                        ip: '10.100.40.10',
+                        mac: '00:DE:AD:BE:EF:01',
+                        hostname: 'NCRTH-TRIAGE-ADMIT01'
+                    })
+                });
+                refreshAll();
+            } catch (e) {
+                alert('Conflict simulation failed');
+            }
+        }
+
+        // Clear Conflict
+        async function resolveAllConflicts() {
+            try {
+                await fetch('/api/conflict/resolve', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({
+                        ip: '10.100.40.10',
+                        mac: '00:1A:2B:3C:4D:5E'
+                    })
+                });
+                refreshAll();
+            } catch (e) {
+                alert('Resolve failed');
+            }
+        }
+
+        function refreshAll() {
+            fetchTopology();
+            fetchDevices();
+        }
+
+        // Initialize and start 3-second polling
+        window.onload = function() {
+            initNetwork();
+            refreshAll();
+            setInterval(refreshAll, 3000);
+        };
+    </script>
+</body>
+</html>
